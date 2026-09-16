@@ -1,0 +1,4 @@
+# Keep SHA-256-validated resources in LF on every platform.
+resources/huijin/huijin_combined.csv text eol=lf
+resources/limit_rules/etf_price_limit_20pct.csv text eol=lf
+resources/limit_rules/manifest.json text eol=lf
