@@ -4,5 +4,5 @@ end_date: 2024-12-31
 initial_cash: "10000"
 case: model
 universe:
-  symbols: []
-  pools: [all_supported_etf]
+  symbols: [SH.510300, SH.518880, SH.588000]
+  pools: []

@@ -26,7 +26,7 @@ MODEL_SETTINGS = ModelSettings(
         weighting="equal",
     ),
     training=XGBoostTrainingConfig(
-        device="cpu",  # 改为 "cuda" 使用 GPU，"cuda:0" 指定第一张显卡。
+        device="cuda:0",  # 改为 "cuda" 使用 GPU，"cuda:0" 指定第一张显卡。
         seed=42,
         num_boost_round=500,
         early_stopping_rounds=30,
