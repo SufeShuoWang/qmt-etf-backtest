@@ -1,0 +1,15 @@
+name: lstm
+start_date: 2024-01-01
+end_date: 2024-12-31
+initial_cash: "1000000"
+case: model
+universe:
+  symbols:
+    - SH.510050  # 上证50
+    - SH.510300  # 沪深300
+    - SH.510500  # 中证500
+    - SH.512100  # 中证1000
+    - SZ.159915  # 创业板
+    - SH.588000  # 科创50
+    - SH.518880  # 黄金
+  pools: []
