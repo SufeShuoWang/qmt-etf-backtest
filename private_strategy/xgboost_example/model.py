@@ -23,7 +23,7 @@ MODEL_SETTINGS = ModelSettings(
         top_k=2,
         total_weight="0.90",
         min_score=-1.0,
-        weighting="softmax",
+        weighting="equal",
     ),
     training=XGBoostTrainingConfig(
         device="cpu",  # 改为 "cuda" 使用 GPU，"cuda:0" 指定第一张显卡。
@@ -37,17 +37,14 @@ MODEL_SETTINGS = ModelSettings(
 )
 
 
-# XGBoost 示例特征构建器：只使用单证券截至信号日的历史价格和成交量。
+# XGBoost 示例特征构建器：只使用证券截至信号日的历史价格和成交量。
 class Features(FeatureBuilder):
-    # 声明三个示例特征的固定名称与顺序。
-    @property
-    def feature_names(self) -> tuple[str, ...]:
-        return ("return_5d", "return_20d", "volume_ratio_5_20")
-
-    # 声明三个特征需要 21 个交易日观察。
-    @property
-    def required_history_trading_days(self) -> int:
-        return 21
+    feature_names: tuple[str, ...] = (
+        "return_5d",
+        "return_20d",
+        "volume_ratio_5_20",
+    )
+    required_history_trading_days: int = 21
 
     # 计算 5／20 日收益及短长均量比；窗口不足、包含停牌或均量无效时不生成样本。
     def build_features(
@@ -70,27 +67,10 @@ class Features(FeatureBuilder):
 
 # 声明示例 XGBoost 模型身份及用户可设的树参数，训练过程由框架工作流执行。
 class Model:
-    """Framework-neutral XGBoost identity and user-owned tree parameters."""
-
     # 返回示例 XGBoost 模型稳定标识。
-    @property
-    def model_id(self) -> str:
-        return "xgboost_three_factor_v1"
-
-    # 返回模型规格的类名称标识，供训练／加载核对。
-    @property
-    def model_class_name(self) -> str:
-        return type(self).__name__
-
-    # 返回示例树模型参数；框架固定参数由工作流另行管理。
-    @property
-    def model_parameters(self) -> Mapping[str, object]:
-        return {
-            "eta": 0.03,
-            "max_depth": 4,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "min_child_weight": 1,
-            "reg_alpha": 0.0,
-            "reg_lambda": 1.0,
-        }
+    model_id = "my_xgboost_v2_equal_weight"
+    model_class_name = "Model"
+    model_parameters = {
+        "eta": 0.03,
+        "max_depth": 8,
+    }
