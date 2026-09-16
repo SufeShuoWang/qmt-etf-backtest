@@ -1,4 +1,4 @@
-"""Public extension points for trusted local Rule and Model experiments."""
+"""可信本地 Rule 和 Model 实验的公开扩展点。"""
 
 from etf_backtest.strategy.loader import UserRuleLoadError, load_user_rule
 from etf_backtest.strategy.model import (
@@ -7,9 +7,13 @@ from etf_backtest.strategy.model import (
     FeatureBuilder,
     LoadedModelComponents,
     ModelSettings,
+    ModelSpec,
+    ModelWorkflow,
+    ModelWorkflowResult,
     TopKPortfolio,
     TorchModelFactory,
     TorchTrainingConfig,
+    XGBoostTrainingConfig,
     load_user_model_components,
 )
 from etf_backtest.strategy.rule import (
@@ -29,6 +33,9 @@ __all__ = [
     "FeatureBuilder",
     "LoadedModelComponents",
     "ModelSettings",
+    "ModelSpec",
+    "ModelWorkflow",
+    "ModelWorkflowResult",
     "NoRebalance",
     "RuleMarketData",
     "RuleSettings",
@@ -39,6 +46,7 @@ __all__ = [
     "UserRule",
     "UserRuleLoadError",
     "WeightInput",
+    "XGBoostTrainingConfig",
     "load_user_model_components",
     "load_user_rule",
 ]

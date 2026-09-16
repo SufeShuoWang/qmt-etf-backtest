@@ -1,4 +1,4 @@
-"""Price-free strategy context tests."""
+"""不含价格信息的策略上下文测试。"""
 
 from datetime import date
 from decimal import Decimal

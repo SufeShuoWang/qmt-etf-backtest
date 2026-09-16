@@ -1,4 +1,4 @@
-"""Fixed user Model extension contract and its shared concrete workflow."""
+"""固定的用户 Model 扩展契约及其共用具体工作流。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType, ModuleType
+from typing import Literal
 
 from etf_backtest.strategy.model_contracts import (
     DAILY_FORWARD_RETURN_LABEL,
@@ -21,6 +22,9 @@ from etf_backtest.strategy.model_contracts import (
     LabeledRecord,
     ModelDataIdentity,
     ModelMetadata,
+    ModelSpec,
+    ModelWorkflow,
+    ModelWorkflowResult,
     PredictionRecord,
     PredictorBundle,
     SampleKey,
@@ -30,13 +34,15 @@ from etf_backtest.strategy.model_contracts import (
 )
 from etf_backtest.strategy.model_runtime import DailyModelStrategy
 from etf_backtest.strategy.model_training import (
-    DailyFourFactorFeatureBuilder,
+    DailyModelDatasetBuilder,
     DailyTorchBundle,
     DailyTorchDatasetBuilder,
     DailyTorchWorkflow,
     DailyTorchWorkflowResult,
     TorchTrainingConfig,
     TorchUnavailableError,
+    LoadedInferenceBundle,
+    load_daily_torch_bundle_for_inference,
 )
 from etf_backtest.strategy.portfolio import (
     AllocationFunction,
@@ -46,14 +52,22 @@ from etf_backtest.strategy.portfolio import (
     TopKPortfolio,
     WeightingMode,
 )
+from etf_backtest.strategy.xgboost_training import (
+    XGBoostTrainingConfig,
+    DailyXGBoostWorkflow,
+    LoadedXGBoostInferenceBundle,
+    load_daily_xgboost_bundle_for_inference,
+    validate_xgboost_model_parameters,
+)
 
 _MODEL_MODULE_PREFIX = "_etf_backtest_user_model_"
 
 
 class UserModelLoadError(ValueError):
-    """A trusted local model file violates the controlled loading contract."""
+    """可信本地模型文件违反受控加载契约。"""
 
 
+# 检查特征／模型构造参数键可作为 Python 参数名，内容可序列化且有限，再冻结映射。
 def _settings_kwargs(value: object, field_name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{field_name} must be a mapping")
@@ -69,13 +83,13 @@ def _settings_kwargs(value: object, field_name: str) -> Mapping[str, object]:
 
 @dataclass(frozen=True, slots=True)
 class ModelSettings:
-    """Model-specific data, training and construction settings owned by ``model.py``.
+    """由 ``model.py`` 管理的模型专属数据、训练和构造设置。
 
-    The backtest test range still comes from the common experiment YAML.  Users
-    may edit every field here; the shared Workflow continues to own labels,
-    train-only scaling, optimization, early stopping and daily inference.
+    回测测试区间仍来自实验共用 YAML。用户可以修改这里的全部字段；共用 Workflow
+    继续统一管理标签、训练集预处理、优化、early stopping 和日频推理。
     """
 
+    backend: Literal["torch", "xgboost"] = "torch"
     train_range: DateRange = field(
         default_factory=lambda: DateRange(date(2021, 1, 1), date(2022, 12, 31))
     )
@@ -83,11 +97,16 @@ class ModelSettings:
         default_factory=lambda: DateRange(date(2023, 1, 1), date(2023, 12, 31))
     )
     portfolio: ModelPortfolioPolicy = field(default_factory=TopKPortfolio)
-    training: TorchTrainingConfig = field(default_factory=TorchTrainingConfig)
+    training: TorchTrainingConfig | XGBoostTrainingConfig = field(
+        default_factory=TorchTrainingConfig
+    )
     feature_kwargs: Mapping[str, object] = field(default_factory=dict)
     model_kwargs: Mapping[str, object] = field(default_factory=dict)
 
+    # 校验模型后端、训练配置、日期切分和组合政策是否匹配，规范特征及模型构造参数。
     def __post_init__(self) -> None:
+        if self.backend not in {"torch", "xgboost"}:
+            raise ValueError("backend must be torch or xgboost")
         if not isinstance(self.train_range, DateRange):
             raise TypeError("train_range must be DateRange")
         if not isinstance(self.valid_range, DateRange):
@@ -96,8 +115,11 @@ class ModelSettings:
             raise ValueError(
                 "train_range and valid_range must be chronological and non-overlapping"
             )
-        if not isinstance(self.training, TorchTrainingConfig):
-            raise TypeError("training must be TorchTrainingConfig")
+        expected_training = (
+            TorchTrainingConfig if self.backend == "torch" else XGBoostTrainingConfig
+        )
+        if not isinstance(self.training, expected_training):
+            raise TypeError(f"{self.backend} backend requires {expected_training.__name__}")
         if not isinstance(self.portfolio, ModelPortfolioPolicy):
             raise TypeError("portfolio must satisfy ModelPortfolioPolicy")
         if (
@@ -122,9 +144,10 @@ class ModelSettings:
         )
 
     def resolved_dict(self) -> dict[str, object]:
-        """Return the exact code-owned values written to workflow provenance."""
+        """返回写入工作流来源信息的精确代码自有值。"""
 
         return {
+            "backend": self.backend,
             "train_range": self.train_range.to_dict(),
             "valid_range": self.valid_range.to_dict(),
             "portfolio": self.portfolio.resolved_dict(),
@@ -136,13 +159,52 @@ class ModelSettings:
 
 @dataclass(frozen=True, slots=True)
 class LoadedModelComponents:
-    """Auditable pair returned by :func:`load_user_model_components`."""
+    """:func:`load_user_model_components` 返回的可审计组件集合。"""
 
     settings: ModelSettings
     feature_builder: FeatureBuilder
-    model_factory: TorchModelFactory
+    model_factory: ModelSpec
     source_path: Path
     source_sha256: str
+
+    def create_workflow(self, data_identity: ModelDataIdentity) -> ModelWorkflow:
+        """回测：按用户模型设置选择训练后端，不在这里执行训练。"""
+        if self.settings.backend == "torch":
+            if not isinstance(self.model_factory, TorchModelFactory):
+                raise TypeError("torch backend requires TorchModelFactory")
+            if not isinstance(self.settings.training, TorchTrainingConfig):
+                raise TypeError("torch backend requires TorchTrainingConfig")
+            return DailyTorchWorkflow(
+                feature_builder=self.feature_builder, model_factory=self.model_factory,
+                data_identity=data_identity, training_config=self.settings.training,
+                portfolio=self.settings.portfolio,
+            )
+        if not isinstance(self.settings.training, XGBoostTrainingConfig):
+            raise TypeError("xgboost backend requires XGBoostTrainingConfig")
+        return DailyXGBoostWorkflow(
+            feature_builder=self.feature_builder, model_spec=self.model_factory,
+            data_identity=data_identity, training_config=self.settings.training,
+            portfolio=self.settings.portfolio,
+        )
+
+    def load_inference_bundle(
+        self, path: Path, *, backend: Literal["torch", "xgboost"], signal_date: date,
+        device: str = "cpu",
+    ) -> LoadedInferenceBundle | LoadedXGBoostInferenceBundle:
+        """模拟盘：按部署配置加载已有模型，保持原有校验，不触发训练。"""
+        if backend == "torch":
+            if not isinstance(self.model_factory, TorchModelFactory):
+                raise TypeError("torch backend requires TorchModelFactory")
+            return load_daily_torch_bundle_for_inference(
+                path, feature_builder=self.feature_builder, model_factory=self.model_factory,
+                portfolio=self.settings.portfolio, signal_date=signal_date,
+                device=device,
+            )
+        return load_daily_xgboost_bundle_for_inference(
+            path, feature_builder=self.feature_builder, model_spec=self.model_factory,
+            portfolio=self.settings.portfolio, signal_date=signal_date,
+            device=device,
+        )
 
 
 def load_user_model_components(
@@ -150,12 +212,10 @@ def load_user_model_components(
     *,
     allowed_root: str | Path,
 ) -> LoadedModelComponents:
-    """Load explicitly named components from one trusted local Python file.
+    """从单个可信本地 Python 文件加载明确命名的组件。
 
-    The selected file must define one module-level ``MODEL_SETTINGS`` value.
-    Its constructor kwargs are passed to the selected feature and model classes.
-    This is a controlled loader, not a sandbox: executing an allowed file grants
-    it normal Python process permissions.
+    所选文件必须定义模块级 ``MODEL_SETTINGS`` 值，其构造参数会传给选定的特征类和
+    模型类。这是受控加载器而非沙箱：执行获准文件时，该文件拥有正常 Python 进程权限。
     """
 
     root = _resolved_model_root(allowed_root)
@@ -189,11 +249,15 @@ def load_user_model_components(
     )
     if not isinstance(feature_instance, FeatureBuilder):
         raise UserModelLoadError(f"{feature_name} must satisfy FeatureBuilder")
-    if not isinstance(model_instance, TorchModelFactory):
+    if not isinstance(model_instance, ModelSpec):
+        raise UserModelLoadError(f"{model_name} must satisfy ModelSpec")
+    if settings.backend == "torch" and not isinstance(model_instance, TorchModelFactory):
         raise UserModelLoadError(f"{model_name} must satisfy TorchModelFactory")
     try:
         validate_feature_builder(feature_instance)
         canonical_json(model_instance.model_parameters)
+        if settings.backend == "xgboost":
+            validate_xgboost_model_parameters(model_instance.model_parameters)
     except (TypeError, ValueError) as exc:
         raise UserModelLoadError(f"loaded model component validation failed: {exc}") from exc
     return LoadedModelComponents(
@@ -205,6 +269,7 @@ def load_user_model_components(
     )
 
 
+# 解析并检查允许加载模型代码的根目录。
 def _resolved_model_root(value: str | Path) -> Path:
     try:
         root = Path(value).resolve(strict=True)
@@ -215,6 +280,7 @@ def _resolved_model_root(value: str | Path) -> Path:
     return root
 
 
+# 解析模型文件并检查其位置及文件类型。
 def _resolved_model_source(value: str | Path, *, root: Path) -> Path:
     supplied = Path(value)
     unresolved = supplied if supplied.is_absolute() else root / supplied
@@ -231,6 +297,7 @@ def _resolved_model_source(value: str | Path, *, root: Path) -> Path:
     return source_path
 
 
+# 执行模型 Python 模块并处理加载异常，取得用户声明的组件。
 def _execute_model_module(*, module_name: str, source_path: Path, source: bytes) -> ModuleType:
     del source
     spec = importlib.util.spec_from_file_location(module_name, source_path)
@@ -250,6 +317,7 @@ def _execute_model_module(*, module_name: str, source_path: Path, source: bytes)
     return module
 
 
+# 按约定名称取得模型或特征类，并检查它符合所需接口。
 def _selected_component_class(module: ModuleType, class_name: str) -> type[object]:
     value = vars(module).get(class_name)
     if not isinstance(value, type):
@@ -257,6 +325,7 @@ def _selected_component_class(module: ModuleType, class_name: str) -> type[objec
     return value
 
 
+# 用配置中的关键字参数实例化组件，给构造错误补充组件上下文。
 def _instantiate_component(
     component_type: type[object],
     parameters: Mapping[str, object],
@@ -275,7 +344,7 @@ __all__ = [
     "DAILY_FORWARD_RETURN_LABEL",
     "AllocationFunction",
     "CustomPortfolio",
-    "DailyFourFactorFeatureBuilder",
+    "DailyModelDatasetBuilder",
     "DailyModelStrategy",
     "DailyTorchBundle",
     "DailyTorchDatasetBuilder",
@@ -291,6 +360,9 @@ __all__ = [
     "ModelMetadata",
     "ModelPortfolioPolicy",
     "ModelSettings",
+    "ModelSpec",
+    "ModelWorkflow",
+    "ModelWorkflowResult",
     "PortfolioWeightInput",
     "PredictionRecord",
     "PredictorBundle",
@@ -301,5 +373,6 @@ __all__ = [
     "TorchUnavailableError",
     "UserModelLoadError",
     "WeightingMode",
+    "XGBoostTrainingConfig",
     "load_user_model_components",
 ]

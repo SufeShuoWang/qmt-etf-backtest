@@ -1,4 +1,4 @@
-"""Framework-neutral daily strategy driven by a predictor bundle."""
+"""由预测器 bundle 驱动且与具体框架无关的日频策略。"""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from etf_backtest.strategy.scheduler import EveryTradingDayScheduler
 
 @dataclass(frozen=True, slots=True)
 class ModelAllocationRecord:
-    """One prediction's rank and applied target weight on a signal date."""
+    """单条预测在信号日的排名及实际采用的目标权重。"""
 
     signal_date: date
     symbol: str
@@ -38,7 +38,7 @@ class ModelAllocationRecord:
 
 
 class DailyModelStrategy(BaseStrategy):
-    """Turn daily model scores into one validated multi-asset target."""
+    """将日频模型分数转换为经过校验的多资产目标组合。"""
 
     __slots__ = (
         "_allocations",
@@ -50,6 +50,7 @@ class DailyModelStrategy(BaseStrategy):
         "_scheduler",
     )
 
+    # 绑定特征构建器、已训练预测包与组合政策，初始化逐日预测和分配记录。
     def __init__(
         self,
         *,
@@ -75,21 +76,26 @@ class DailyModelStrategy(BaseStrategy):
         self._allocations: list[ModelAllocationRecord] = []
         self._scheduler = EveryTradingDayScheduler()
 
+    # 返回已经生成的预测记录，供结果文件与评估使用。
     @property
     def predictions(self) -> tuple[PredictionRecord, ...]:
         return tuple(self._predictions)
 
+    # 返回逐日组合分配记录，供审计模型得分如何变成仓位。
     @property
     def allocations(self) -> tuple[ModelAllocationRecord, ...]:
         return tuple(self._allocations)
 
+    # 返回特征构建器要求的历史窗口长度。
     @property
     def required_history_trading_days(self) -> int:
         return self._lookback
 
+    # 使用每日调度器判断是否生成模型目标。
     def should_generate_target(self, frame_index: int) -> bool:
         return self._scheduler.should_decide(frame_index)
 
+    # 为信号日构建特征并预测，核对预测主键后分配权重；输出覆盖证券范围的目标，当前空／无正权重分配会报错。
     def _generate_target(
         self,
         *,
@@ -98,7 +104,7 @@ class DailyModelStrategy(BaseStrategy):
         account_view: AccountView,
         context: StrategyContext,
     ) -> TargetPortfolio:
-        del account_view, context
+        del account_view
         if signal_date <= self._bundle.metadata.trained_through:
             raise ValueError("model signal_date must follow the training interval")
         records = feature_records_for_signal(
@@ -107,7 +113,7 @@ class DailyModelStrategy(BaseStrategy):
             signal_date=signal_date,
         )
         if not records:
-            return TargetPortfolio(weights={})
+            raise ValueError("model signal date produced no feature records")
         predictions = self._bundle.predict(records)
         expected_keys = tuple(record.key for record in records)
         actual_keys = tuple(prediction.key for prediction in predictions)
@@ -121,6 +127,9 @@ class DailyModelStrategy(BaseStrategy):
             predictions=predictions,
             exposure_cap=self._portfolio.max_total_weight,
         )
+        if not weights or not any(weight > Decimal("0") for weight in weights.values()):
+            raise ValueError("model portfolio must select at least one positive-weight symbol")
+        complete_weights = {symbol: weights.get(symbol, Decimal("0")) for symbol in context.symbols}
         ranked = sorted(
             predictions,
             key=lambda prediction: (prediction.score, prediction.key.symbol),
@@ -137,7 +146,7 @@ class DailyModelStrategy(BaseStrategy):
             )
             for rank, prediction in enumerate(ranked, start=1)
         )
-        return TargetPortfolio(weights=weights)
+        return TargetPortfolio(weights=complete_weights)
 
 
 __all__ = ["DailyModelStrategy", "ModelAllocationRecord"]

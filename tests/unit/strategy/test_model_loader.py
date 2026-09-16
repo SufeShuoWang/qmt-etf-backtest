@@ -1,4 +1,4 @@
-"""User-facing Model loader stays framework-lazy."""
+"""面向用户的 Model 加载器保持延迟依赖框架的测试。"""
 
 from datetime import date
 from decimal import Decimal
@@ -129,3 +129,38 @@ class Model:
             source.name,
             allowed_root=tmp_path,
         )
+
+
+@pytest.mark.unit
+def test_model_loader_accepts_xgboost_spec_without_torch_create(tmp_path) -> None:
+    source = tmp_path / "xgboost_model.py"
+    source.write_text(
+        """
+from datetime import date
+from etf_backtest.strategy.model import DateRange, ModelSettings, XGBoostTrainingConfig
+
+MODEL_SETTINGS = ModelSettings(
+    backend="xgboost",
+    train_range=DateRange(date(2021, 1, 1), date(2021, 1, 31)),
+    valid_range=DateRange(date(2021, 2, 1), date(2021, 2, 28)),
+    training=XGBoostTrainingConfig(num_boost_round=10, early_stopping_rounds=2),
+)
+
+class Features:
+    feature_names = ("x",)
+    required_history_trading_days = 1
+    def build_features(self, *, symbol, signal_date, history):
+        return (1,)
+
+class Model:
+    model_id = "tests.xgboost"
+    model_class_name = "Model"
+    model_parameters = {"max_depth": 2}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    loaded = load_user_model_components(source, allowed_root=tmp_path)
+
+    assert loaded.settings.backend == "xgboost"
+    assert loaded.model_factory.model_id == "tests.xgboost"

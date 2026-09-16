@@ -1,4 +1,4 @@
-"""Pure Decimal fee calculation for each individual formal fill."""
+"""对每笔正式成交独立执行的纯 Decimal 费用计算。"""
 
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
@@ -12,11 +12,12 @@ _MONEY_QUANTUM: Final = Decimal("0.001")
 
 
 def _quantize_money(value: Decimal) -> Decimal:
-    """Return a fee amount at the shared financial result precision."""
+    """按统一财务结果精度返回费用金额。"""
 
     return value.quantize(_MONEY_QUANTUM, rounding=ROUND_HALF_UP)
 
 
+# 检查费用计算所用金额是有限非负 Decimal。
 def _require_non_negative_money(value: object, field_name: str) -> Decimal:
     if not isinstance(value, Decimal):
         raise TypeError(f"{field_name} must be Decimal")
@@ -29,12 +30,13 @@ def _require_non_negative_money(value: object, field_name: str) -> Decimal:
 
 @dataclass(frozen=True, slots=True)
 class FeeBreakdown:
-    """Immutable per-fill fee components."""
+    """不可变的逐笔成交费用明细。"""
 
     commission: Decimal
     stamp_duty: Decimal
     total: Decimal
 
+    # 校验佣金、印花税及总费用之间的数值关系。
     def __post_init__(self) -> None:
         commission = _require_non_negative_money(self.commission, "commission")
         stamp_duty = _require_non_negative_money(self.stamp_duty, "stamp_duty")
@@ -44,10 +46,11 @@ class FeeBreakdown:
 
 
 class FeeModel:
-    """Calculate commission and direction-specific fees per trade."""
+    """逐笔计算佣金及区分买卖方向的费用。"""
 
     __slots__ = ("_config",)
 
+    # 保存佣金比例、最低佣金及印花税参数，供每笔成交统一计费。
     def __init__(self, config: FeeConfig) -> None:
         if not isinstance(config, FeeConfig):
             raise TypeError("config must be FeeConfig")
@@ -59,7 +62,7 @@ class FeeModel:
         trade_amount: Decimal,
         side: OrderSide,
     ) -> FeeBreakdown:
-        """Return one independent fee breakdown for a candidate fill."""
+        """返回单笔候选成交的独立费用明细。"""
         amount = _require_non_negative_money(trade_amount, "trade_amount")
         if not isinstance(side, OrderSide):
             raise TypeError("side must be OrderSide")

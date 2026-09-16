@@ -1,4 +1,4 @@
-"""Private Rule/Model experiment CLI tests without external MySQL."""
+"""不依赖外部 MySQL 的私有 Rule/Model 实验命令行测试。"""
 
 import json
 from pathlib import Path

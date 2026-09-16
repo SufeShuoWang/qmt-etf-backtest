@@ -1,4 +1,3 @@
-# ruff: noqa: RUF002, RUF003
 """助力汇金：七只 ETF 共同确认信号，510300 的 Ymin 锚定组合仓位。
 
 上证指数的 60 日高点回撤仅用于区分小周期和大周期；七只 ETF 的份额
@@ -30,6 +29,7 @@ _ZERO = Decimal("0")
 _ONE = Decimal("1")
 
 
+# 保存单证券份额增减、常态流量倍数及量价背离信号。
 @dataclass(frozen=True, slots=True)
 class _FlowMetrics:
     signal_valid: bool
@@ -41,6 +41,7 @@ class _FlowMetrics:
     sell_divergence: bool
 
 
+# 保存单证券当前仓位、份额信号和汇金持仓估计上下界，供组合决策。
 @dataclass(frozen=True, slots=True)
 class _EtfSnapshot:
     current_weight: Decimal
@@ -49,6 +50,7 @@ class _EtfSnapshot:
     ymax: Decimal | None
 
 
+# 汇总资产池内申购、赎回、大额流入及量价背离的覆盖比例和份额净变化。
 @dataclass(frozen=True, slots=True)
 class _Widths:
     all_signal_valid: bool
@@ -60,6 +62,7 @@ class _Widths:
     aggregate_share_change_5d: Decimal
 
 
+# 读取并校验本策略的 Decimal 参数，统一阈值与仓位计算精度。
 def _decimal_parameter(parameters: Mapping[str, object], key: str) -> Decimal:
     value = parameters[key]
     result = Decimal(str(value))
@@ -68,6 +71,7 @@ def _decimal_parameter(parameters: Mapping[str, object], key: str) -> Decimal:
     return result
 
 
+# 读取并校验本策略的整数周期参数。
 def _integer_parameter(parameters: Mapping[str, object], key: str) -> int:
     value = parameters[key]
     if type(value) is not int or value <= 0:
@@ -75,11 +79,13 @@ def _integer_parameter(parameters: Mapping[str, object], key: str) -> int:
     return value
 
 
+# 从份额映射中取不晚于截止日的最新观察，用于报告期份额基准。
 def _last_share_on_or_before(shares: Mapping[date, Decimal], cutoff: date) -> Decimal | None:
     eligible = tuple(asof_date for asof_date in shares if asof_date <= cutoff)
     return None if not eligible else shares[max(eligible)]
 
 
+# 计算指定日收盘距阶段最高点的指数点数差；历史不足时返回 None。
 def _drawdown_at(
     index_bars: Sequence[IndexBarView],
     trade_date: date,
@@ -93,6 +99,7 @@ def _drawdown_at(
     return max(bar.high for bar in window) - index_bars[position].close
 
 
+# 计算 Decimal 序列中位数，供缺失锚点时的组合参考。
 def _median(values: Sequence[Decimal]) -> Decimal | None:
     if not values:
         return None
@@ -103,6 +110,7 @@ def _median(values: Sequence[Decimal]) -> Decimal | None:
     return (ordered[middle - 1] + ordered[middle]) / Decimal("2")
 
 
+# 统计不含当日的历史正份额增量均值；缺少所需观察或无正增量时返回 None。
 def _positive_flow_average(
     *,
     bars: Sequence[MarketBarView],
@@ -110,8 +118,7 @@ def _positive_flow_average(
     position: int,
     lookback_days: int,
 ) -> Decimal | None:
-    # The current day's increment is excluded. The window contains the 20
-    # completed one-day share changes immediately preceding the signal day.
+    # 不包含当日增量；窗口只包含信号日前已经完成的 20 个单日份额变化。
     if position < lookback_days + 1:
         return None
     positive_changes: list[Decimal] = []
@@ -128,6 +135,7 @@ def _positive_flow_average(
     return sum(positive_changes, start=_ZERO) / Decimal(len(positive_changes))
 
 
+# 用精确份额观察计算 1／5 日变化、相对常态流量倍数和价格／份额背离，缺数据时标记信号无效。
 def _flow_metrics_at(
     *,
     bars: Sequence[MarketBarView],
@@ -189,6 +197,7 @@ def _flow_metrics_at(
     )
 
 
+# 把各 ETF 份额信号汇总为占全体标的的比例，另计算 5 日份额变化总和。
 def _widths(
     metrics_by_symbol: Mapping[str, _FlowMetrics],
     *,
@@ -274,6 +283,7 @@ class Strategy(UserRule):
         },
     )
 
+    # 结合指数回撤、份额宽度和汇金仓位估计生成组合目标；减仓条件优先，再判断分阶段建仓，未触发时保持持仓。
     def generate_weights(self, data: RuleMarketData) -> RuleOutput:
         parameters = self.parameters
         # 交易标的只在 experiment.yaml 的 universe 中维护，避免两处名单不一致。
@@ -308,6 +318,7 @@ class Strategy(UserRule):
         index_bars = data.index_bars(market_index)
         metrics_cache: dict[tuple[str, date], _FlowMetrics] = {}
 
+        # 缓存指定日期各证券的份额指标，避免多个条件重复计算。
         def metrics_for(symbol: str, trade_date: date) -> _FlowMetrics:
             key = (symbol, trade_date)
             cached = metrics_cache.get(key)
@@ -322,6 +333,7 @@ class Strategy(UserRule):
             metrics_cache[key] = result
             return result
 
+        # 缓存指定日期资产池信号宽度，供连续触发天数判断。
         def widths_for(trade_date: date) -> _Widths:
             return _widths(
                 {symbol: metrics_for(symbol, trade_date) for symbol in trade_etfs},
@@ -391,6 +403,7 @@ class Strategy(UserRule):
                 use_median_floor=True,
             )
 
+        # 封装某日是否满足小幅回撤建仓条件，供连续信号检查。
         def small_condition(trade_date: date) -> bool:
             return self._is_small_buy_day(
                 trade_date=trade_date,
@@ -421,6 +434,7 @@ class Strategy(UserRule):
 
         return NO_REBALANCE
 
+    # 结合当前份额、报告期份额和同报告期汇金比例，计算单证券仓位估计与当前权重快照。
     @staticmethod
     def _snapshot(
         *,
@@ -447,6 +461,7 @@ class Strategy(UserRule):
             ymax=share_ratio_to_disclosure,
         )
 
+    # 检查锚点 ETF 的估计持仓下界是否连续下降，缺少所需份额或报告期信息时不触发。
     @staticmethod
     def _anchor_ymin_declines(
         *,
@@ -476,6 +491,7 @@ class Strategy(UserRule):
             ymins.append(max(_ZERO, current_share / disclosure_share - (_ONE - huijin_ratio)))
         return all(current < previous for previous, current in pairwise(ymins))
 
+    # 向历史回看并统计连续满足指定宽度条件的天数。
     @staticmethod
     def _consecutive_width_days(
         *,
@@ -495,6 +511,7 @@ class Strategy(UserRule):
             streak += 1
         return streak
 
+    # 判断指数点数回撤处于小幅区间、申购覆盖达标且份额合计增加。
     @staticmethod
     def _is_small_buy_day(
         *,
@@ -515,6 +532,7 @@ class Strategy(UserRule):
             and widths.aggregate_share_change_5d > _ZERO
         )
 
+    # 取得锚点 ETF 的持仓下界和全体中位数；锚点缺失时使用中位数。
     @staticmethod
     def _position_anchor(
         *,
@@ -530,6 +548,7 @@ class Strategy(UserRule):
             anchor_ymin = median_ymin
         return anchor_ymin, median_ymin
 
+    # 依据估计持仓与建仓阶段分配买入目标，约束总仓位和单日增加幅度。
     @classmethod
     def _buy_targets(
         cls,
@@ -584,6 +603,7 @@ class Strategy(UserRule):
             raise ValueError("target weights exceed 100%")
         return targets
 
+    # 按减仓规则生成显式目标，考虑每日减仓上限与保留底仓。
     @classmethod
     def _reduce_targets(
         cls,

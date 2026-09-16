@@ -1,9 +1,9 @@
-"""Prepare, validate and run one trusted local Rule or Model experiment."""
+"""准备、校验并运行单个可信本地 Rule 或 Model 实验。"""
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -11,30 +11,37 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
-from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
 
+from etf_backtest.application.runtime_factory import (
+    BacktestRuntime,
+    build_backtest_runtime,
+    create_database_engine,
+    required_project_resource,
+)
+from etf_backtest.application.strategy_source import (
+    RuleStrategySource,
+    ModelStrategySource,
+    StrategySource,
+    load_strategy_source,
+    build_backtest_config,
+)
 from etf_backtest.config.schema import (
     BacktestConfig,
-    DatabaseConfig,
     ModelStrategyConfig,
-    RuleStrategyConfig,
-    etf_code,
 )
 from etf_backtest.core.account import Account
 from etf_backtest.core.effective_rules import (
     EffectiveDatedEtfRuleResolver,
-    load_effective_rule_resolver,
 )
 from etf_backtest.core.engine import BacktestEngine, BacktestResult
 from etf_backtest.core.etf_rules import EtfRuleEngine
 from etf_backtest.core.fee import FeeModel
-from etf_backtest.core.fill import FillModel
+from etf_backtest.core.fill import FillModel, SlippageModel
 from etf_backtest.core.market import MarketBarView
 from etf_backtest.core.order_generator import OrderGenerator
 from etf_backtest.core.position import Position
-from etf_backtest.core.slippage import SlippageModel
-from etf_backtest.data.mysql import QmtDailyDataset, QmtDailyRepository
+from etf_backtest.data.mysql import QmtDailyDataset
 from etf_backtest.data.portal import DailyDataPortal
 from etf_backtest.evaluation.backtest_metrics import (
     BacktestMetricResult,
@@ -43,244 +50,129 @@ from etf_backtest.evaluation.backtest_metrics import (
     TradeMetricRow,
 )
 from etf_backtest.evaluation.backtest_plots import render_backtest_plots
-from etf_backtest.experiments.config import (
-    SystemSettings,
-    UserExperimentConfig,
-    load_system_settings,
-    load_user_experiment_config,
-)
+from etf_backtest.file_utils import sha256_file
 from etf_backtest.output.writer import BacktestOutputWriter, ModelArtifacts
 from etf_backtest.strategy.base import BaseStrategy
-from etf_backtest.strategy.loader import load_user_rule
-from etf_backtest.strategy.model import LoadedModelComponents, load_user_model_components
-from etf_backtest.strategy.model_contracts import DateRange, ModelDataIdentity, prediction_rows
-from etf_backtest.strategy.model_runtime import DailyModelStrategy
-from etf_backtest.strategy.model_training import (
-    DailyTorchDatasetBuilder,
-    DailyTorchWorkflow,
-    DailyTorchWorkflowResult,
-    require_torch,
+from etf_backtest.strategy.model import LoadedModelComponents
+from etf_backtest.strategy.model_contracts import (
+    DateRange,
+    ModelDataIdentity,
+    ModelWorkflow,
+    ModelWorkflowResult,
+    prediction_rows,
 )
-from etf_backtest.strategy.rule import SimpleRuleStrategy, UserRule
-from etf_backtest.universe.resolver import FrozenUniverse, FrozenUniverseResolver
+from etf_backtest.strategy.model_runtime import DailyModelStrategy
+from etf_backtest.strategy.model_data import DailyModelDatasetBuilder
+from etf_backtest.universe.resolver import FrozenUniverse
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_SYSTEM_CONFIG = _PROJECT_ROOT / "qmt_example" / "configs" / "system.yaml"
 
 
-@dataclass(frozen=True, slots=True)
-class PreparedExperiment:
-    """The one configured strategy plus shared system settings."""
-
-    source_path: Path
-    experiment: UserExperimentConfig
-    system: SystemSettings
-    rule: UserRule | None
-    rule_source_sha256: str | None
-    model: LoadedModelComponents | None
-
-
+# 保存训练后策略、训练工作流、训练结果与各数据切分样本数，供回测和模型文件输出。
 @dataclass(slots=True)
 class _ModelRuntime:
     strategy: DailyModelStrategy
-    workflow: DailyTorchWorkflow
-    result: DailyTorchWorkflowResult
+    workflow: ModelWorkflow
+    result: ModelWorkflowResult
     sample_counts: tuple[int, int, int]
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _database_engine(database: DatabaseConfig) -> Engine:
-    url = URL.create(
-        "mysql+pymysql",
-        username=database.user,
-        password=database.resolved_password(),
-        host=database.host,
-        port=database.port,
-        database=database.database,
-        query={"charset": database.charset},
-    )
-    return create_engine(
-        url,
-        pool_pre_ping=True,
-        connect_args={"connect_timeout": database.connect_timeout_seconds},
-    )
-
-
-def _required_resource(path: Path, root: Path, label: str) -> Path:
-    target = (root / path).resolve()
-    if not target.is_relative_to(root) or not target.is_file():
-        raise FileNotFoundError(f"{label} is missing: {target}")
-    return target
-
-
-def prepare_experiment(
-    experiment_path: Path,
-    *,
-    system_path: Path = _DEFAULT_SYSTEM_CONFIG,
-    project_root: Path = _PROJECT_ROOT,
-    require_password: bool = True,
-) -> PreparedExperiment:
-    """Load configuration and exactly one fixed-name trusted strategy file."""
-
-    root = Path(project_root).resolve()
-    source = Path(experiment_path).resolve(strict=True)
-    if not source.is_file() or source.suffix.casefold() not in {".yaml", ".yml"}:
-        raise ValueError("experiment must be one existing YAML file")
-    experiment = load_user_experiment_config(source)
-    system = load_system_settings(Path(system_path).resolve(strict=True))
-    _required_resource(system.limit_rules_csv, root, "limit rule CSV")
-    _required_resource(system.limit_rules_manifest, root, "limit rule manifest")
-    if require_password:
-        system.database.resolved_password()
-
-    rule: UserRule | None = None
-    rule_hash: str | None = None
-    model: LoadedModelComponents | None = None
-    if experiment.case == "rule":
-        rule_path = source.parent / "rule.py"
-        rule = load_user_rule(rule_path, allowed_root=source.parent)
-        rule_hash = _sha256(rule_path.resolve(strict=True))
-    else:
-        require_torch()
-        model = load_user_model_components(
-            source.parent / "model.py",
-            allowed_root=source.parent,
-        )
-    prepared = PreparedExperiment(source, experiment, system, rule, rule_hash, model)
-    _strategy_config(prepared)
-    return prepared
-
-
-def _strategy_config(prepared: PreparedExperiment) -> RuleStrategyConfig | ModelStrategyConfig:
-    if prepared.experiment.case == "rule":
-        assert prepared.rule is not None
-        return RuleStrategyConfig(
-            lookback_trading_days=prepared.rule.lookback_trading_days,
-            rebalance_every_trading_days=prepared.rule.rebalance_every_trading_days,
-            target_weight=prepared.rule.target_weight,
-        )
-    assert prepared.model is not None
-    settings = prepared.model.settings
-    if settings.valid_range.end_date >= prepared.experiment.start_date:
-        raise ValueError("model validation range must end before the backtest starts")
-    return ModelStrategyConfig(
-        max_total_weight=settings.portfolio.max_total_weight,
-        train_start=settings.train_range.start_date,
-        train_end=settings.train_range.end_date,
-        valid_start=settings.valid_range.start_date,
-        valid_end=settings.valid_range.end_date,
-        test_start=prepared.experiment.start_date,
-        test_end=prepared.experiment.end_date,
-    )
-
-
-def _load_start(prepared: PreparedExperiment) -> date:
-    if prepared.rule is not None:
-        return prepared.experiment.start_date - timedelta(
-            days=max(90, prepared.rule.lookback_trading_days * 3)
-        )
-    assert prepared.model is not None
-    lookback = prepared.model.feature_builder.required_history_trading_days
-    return prepared.model.settings.train_range.start_date - timedelta(days=max(90, lookback * 3))
-
-
-def _table_checks(prepared: PreparedExperiment) -> tuple[tuple[str, str], ...]:
-    snapshot = prepared.system.data_snapshot
-    checks = [
-        ("database", "SELECT 1"),
-        (
-            "dim_trading_calendar",
-            "SELECT cal_date FROM dim_trading_calendar WHERE exchange = 'SSE' LIMIT 1",
-        ),
-        (snapshot.raw_table, f"SELECT trade_date FROM `{snapshot.raw_table}` LIMIT 1"),
-        (snapshot.front_table, f"SELECT trade_date FROM `{snapshot.front_table}` LIMIT 1"),
-        ("dim_etf", "SELECT etf_code FROM dim_etf LIMIT 1"),
-        (
-            snapshot.trade_status_table,
-            f"SELECT trade_date FROM `{snapshot.trade_status_table}` LIMIT 1",
-        ),
-    ]
-    if snapshot.share_table is not None:
-        checks.append(
-            (snapshot.share_table, f"SELECT asof_date FROM `{snapshot.share_table}` LIMIT 1")
-        )
-    if snapshot.index_table is not None:
-        checks.append(
-            (snapshot.index_table, f"SELECT trade_date FROM `{snapshot.index_table}` LIMIT 1")
-        )
-    return tuple(checks)
-
-
-def validate_experiment(
+# 一次回测的总入口：准备配置、数据与策略，运行逐日引擎并输出结果；try 之前的准备异常由外层入口处理。
+def run_experiment(
     experiment_path: Path,
     *,
     system_path: Path = _DEFAULT_SYSTEM_CONFIG,
     project_root: Path = _PROJECT_ROOT,
 ) -> dict[str, object]:
-    """Check local inputs, MySQL access, required tables and explicit symbols."""
+    """只运行一个策略，并以原子方式发布其固定结果集。"""
 
+    root = Path(project_root).resolve()
     prepared = prepare_experiment(
         experiment_path,
         system_path=system_path,
-        project_root=project_root,
-        require_password=True,
+        project_root=root,
     )
-    sql_engine = _database_engine(prepared.system.database)
-    checked: list[str] = []
-    try:
-        with sql_engine.connect() as connection:
-            for label, statement in _table_checks(prepared):
-                if connection.execute(text(statement)).first() is None:
-                    raise ValueError(f"required MySQL source contains no readable rows: {label}")
-                checked.append(label)
-            for symbol in prepared.experiment.universe.symbols:
-                row = connection.execute(
-                    text("SELECT etf_code FROM dim_etf WHERE etf_code = :code LIMIT 1"),
-                    {"code": etf_code(symbol)},
-                ).first()
-                if row is None:
-                    raise ValueError(f"configured ETF is missing from dim_etf: {symbol}")
-    finally:
-        sql_engine.dispose()
-    return {
-        "status": "valid",
+    config = build_backtest_config(prepared)
+    runs_dir = (root / config.runs_dir).resolve()
+    if not runs_dir.is_relative_to(root):
+        raise ValueError("runs_dir must stay inside the project")
+    run_id = _run_id(prepared.experiment.case)
+    writer = BacktestOutputWriter(runs_dir)
+    metadata: dict[str, object] = {
         "name": prepared.experiment.name,
         "case": prepared.experiment.case,
-        "experiment_path": str(prepared.source_path),
-        "checked_mysql_sources": tuple(checked),
-        "checked_symbols": prepared.experiment.universe.symbols,
+        "experiment_path": prepared.experiment_path,
+        "experiment_sha256": sha256_file(prepared.experiment_path),
+        "system_path": Path(system_path).resolve(strict=True),
+        "resolved_config": config.resolved_dict(),
+        "rule_source_sha256": (prepared.strategy_source_sha256 if isinstance(prepared, RuleStrategySource) else None),
     }
+    sql_engine: Engine | None = None
+    try:
+        sql_engine = create_database_engine(config.database)
+        model_runtime: _ModelRuntime | None = None
+        strategy: BaseStrategy
+        runtime = build_backtest_runtime(
+            config=config, project_root=root, engine=sql_engine,
+            load_start=_load_start(prepared), load_end=config.end_date,
+        )
+        # 规则直接计算目标；模型先训练一次，再交给同一个逐日回测引擎。
+        if isinstance(prepared, RuleStrategySource):
+            strategy = prepared.strategy
+        else:
+            model_runtime = _build_model(
+                config, prepared.components, runtime.portal.views_through(config.end_date)
+            )
+            strategy = model_runtime.strategy
+        result = _run_backtest(config, runtime, strategy)
+        run_dir = _write_results(
+            config, prepared, runtime, result, model_runtime,
+            writer=writer, runs_dir=runs_dir, run_id=run_id, metadata=metadata,
+        )
+        return {
+            "status": "success",
+            "experiment": prepared.experiment.name,
+            "case": prepared.experiment.case,
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+            "daily_count": len(result.daily_snapshots),
+            "order_count": len(result.orders),
+            "trade_count": len(result.fills),
+        }
+    except Exception as exc:
+        writer.write_failure(run_id=run_id, run_metadata=metadata, error=exc)
+        raise
+    finally:
+        if sql_engine is not None:
+            sql_engine.dispose()
 
 
-def _repository(config: BacktestConfig, engine: Engine) -> QmtDailyRepository:
-    return QmtDailyRepository(
-        engine,
-        dataset_version=config.data_snapshot.dataset_version,
-        trade_status_table=config.data_snapshot.trade_status_table,
-        share_table=config.data_snapshot.share_table,
-        index_table=config.data_snapshot.index_table,
-        index_codes=config.data_snapshot.rule_index_codes,
-        huijin_holders_csv=config.data_snapshot.huijin_holders_csv,
-        huijin_holders_csv_sha256=config.data_snapshot.huijin_holders_csv_sha256,
-    )
+# 加载策略来源，检查规则资源路径和密码可解析性；此处不验证数据库网络连接。
+def prepare_experiment(
+    experiment_path: Path, *, system_path: Path = _DEFAULT_SYSTEM_CONFIG,
+    project_root: Path = _PROJECT_ROOT,
+) -> StrategySource:
+    source = load_strategy_source(experiment_path, system_path=system_path)
+    root = Path(project_root).resolve()
+    required_project_resource(source.system.limit_rules_csv, root, "limit rule CSV")
+    required_project_resource(source.system.limit_rules_manifest, root, "limit rule manifest")
+    source.system.database.resolved_password()
+    return source
 
 
-def _resolve_universe(config: BacktestConfig, repository: QmtDailyRepository) -> FrozenUniverse:
-    return FrozenUniverseResolver(repository).resolve(
-        explicit_symbols=config.universe.symbols,
-        pools=config.universe.pools,
-        start_date=config.start_date,
-        end_date=config.end_date,
-    )
+# 向回测开始日或模型训练开始日前预留历史窗口；使用至少 90 个日历日的估算回溯。
+def _load_start(prepared: StrategySource) -> date:
+    if isinstance(prepared, RuleStrategySource):
+        return prepared.experiment.start_date - timedelta(
+            days=max(90, prepared.rule.lookback_trading_days * 3)
+        )
+    assert isinstance(prepared, ModelStrategySource)
+    lookback = prepared.components.feature_builder.required_history_trading_days
+    return prepared.components.settings.train_range.start_date - timedelta(days=max(90, lookback * 3))
 
 
+# 从快照配置提取模型数据身份，供训练、保存与推理校验一致性。
 def _model_identity(config: BacktestConfig) -> ModelDataIdentity:
     return ModelDataIdentity(
         dataset_version=config.data_snapshot.dataset_version,
@@ -289,6 +181,7 @@ def _model_identity(config: BacktestConfig) -> ModelDataIdentity:
     )
 
 
+# 构造训练／验证／测试数据集并训练一次，检查产物元数据后包装成 DailyModelStrategy。
 def _build_model(
     config: BacktestConfig,
     components: LoadedModelComponents,
@@ -300,23 +193,19 @@ def _build_model(
         DateRange(config.strategy.valid_start, config.strategy.valid_end),
         DateRange(config.strategy.test_start, config.strategy.test_end),
     )
-    dataset = DailyTorchDatasetBuilder(components.feature_builder).build(
+    dataset = DailyModelDatasetBuilder(components.feature_builder).build(
         market_views=market_views,
         train_range=ranges[0],
         valid_range=ranges[1],
         test_range=ranges[2],
     )
-    workflow = DailyTorchWorkflow(
-        feature_builder=components.feature_builder,
-        model_factory=components.model_factory,
-        data_identity=_model_identity(config),
-        training_config=components.settings.training,
-    )
+    data_identity = _model_identity(config)
+    workflow = components.create_workflow(data_identity)
     result = workflow.fit(dataset)
     metadata = result.bundle.metadata
     if (metadata.train_range, metadata.valid_range, metadata.test_range) != ranges:
         raise RuntimeError("fitted model split metadata does not match configured ranges")
-    if metadata.data_identity != _model_identity(config):
+    if metadata.data_identity != data_identity:
         raise RuntimeError("fitted model data identity does not match the backtest snapshot")
     if metadata.trained_through >= config.start_date:
         raise ValueError("fitted model must be trained before the first backtest signal")
@@ -332,18 +221,104 @@ def _build_model(
     )
 
 
-def _metrics(initial_cash: Decimal, result: BacktestResult) -> BacktestMetricResult:
+# 用初始资金建立零持仓账户，组合费用、滑点、规则审批和订单生成组件，再运行 BacktestEngine 并核对日快照覆盖。
+def _run_backtest(
+    config: BacktestConfig, runtime: BacktestRuntime, strategy: BaseStrategy,
+) -> BacktestResult:
+    """创建账户与成交组件，执行逐日回测并检查净值日期覆盖。"""
+    account = Account(
+        cash=config.initial_cash,
+        positions={
+            info.symbol: Position(
+                symbol=info.symbol,
+                turnover_rule=runtime.rule_resolver.resolve(
+                    info.symbol,
+                    max(config.start_date, info.list_date),
+                ).turnover_rule,
+            )
+            for info in runtime.universe.etf_infos
+        },
+    )
+    fill_model = FillModel(
+        fee_model=FeeModel(config.fee),
+        slippage_model=SlippageModel(config.slippage),
+    )
+    result = BacktestEngine(
+        portal=runtime.portal,
+        account=account,
+        strategy=strategy,
+        rule_resolver=runtime.rule_resolver,
+        rule_engine=EtfRuleEngine(
+            fill_model=fill_model,
+            volume_participation_rate=config.volume_participation_rate,
+        ),
+        order_generator=OrderGenerator(),
+        fill_model=fill_model,
+    ).run(start_date=config.start_date, end_date=config.end_date)
+    expected_dates = runtime.portal.trading_calendar.trading_dates(config.start_date, config.end_date)
+    if tuple(row.trade_date for row in result.daily_snapshots) != expected_dates:
+        raise RuntimeError("daily NAV does not exactly cover configured SSE dates")
+    return result
+
+
+# 把回测快照和成交交给指标、图表及写入器，模型产物在临时目录有效期间一并发布。
+def _write_results(
+    config: BacktestConfig, prepared: StrategySource, runtime: BacktestRuntime,
+    result: BacktestResult, model_runtime: _ModelRuntime | None,
+    *, writer: BacktestOutputWriter, runs_dir: Path, run_id: str,
+    metadata: dict[str, object],
+) -> Path:
+    """整理指标、来源和图表，并在模型临时文件有效期内写完所有结果。"""
+    daily_rows = tuple(
+        DailyMetricRow(row.trade_date, row.cash, row.market_value, row.total_asset)
+        for row in result.daily_snapshots
+    )
+    calculated_metrics = _metrics(config.initial_cash, result, daily_rows)
+    metadata["provenance"] = _provenance(
+        config,
+        runtime.dataset,
+        runtime.portal,
+        runtime.universe,
+        runtime.rule_resolver,
+    )
+    metadata["rule_settings"] = (
+        prepared.rule.settings.resolved_dict() if isinstance(prepared, RuleStrategySource) else None
+    )
+    plots = render_backtest_plots(initial_cash=config.initial_cash, daily_rows=daily_rows)
+    # 规则与模型共用一次写出；模型附件写完后才清理临时目录。
+    with ExitStack() as resources:
+        model_artifacts = None
+        if model_runtime is not None:
+            assert isinstance(prepared, ModelStrategySource)
+            metadata["model"] = _model_metadata(model_runtime, prepared.components)
+            temp_directory = resources.enter_context(TemporaryDirectory(prefix="qmt-model-bundle-"))
+            bundle_path = model_runtime.workflow.save(
+                Path(temp_directory) / model_runtime.workflow.bundle_filename,
+                source_run_dir=runs_dir / run_id,
+            )
+            model_artifacts = ModelArtifacts(
+                bundle_path=bundle_path,
+                bundle_filename=model_runtime.workflow.bundle_filename,
+                predictions=prediction_rows(model_runtime.strategy.predictions),
+            )
+        return writer.write_success(
+            run_id=run_id,
+            run_metadata=metadata,
+            result=result,
+            metrics=calculated_metrics,
+            plots=plots,
+            model_artifacts=model_artifacts,
+        )
+
+
+
+# 将账户快照与成交记录投影为绩效输入，调用统一指标计算器。
+def _metrics(
+    initial_cash: Decimal, result: BacktestResult, daily_rows: tuple[DailyMetricRow, ...],
+) -> BacktestMetricResult:
     return BacktestMetrics.calculate(
         initial_cash=initial_cash,
-        daily_rows=tuple(
-            DailyMetricRow(
-                trade_date=row.trade_date,
-                cash=row.cash,
-                market_value=row.market_value,
-                total_asset=row.total_asset,
-            )
-            for row in result.daily_snapshots
-        ),
+        daily_rows=daily_rows,
         trade_rows=tuple(
             TradeMetricRow(
                 trade_amount=fill.trade_amount,
@@ -357,6 +332,7 @@ def _metrics(initial_cash: Decimal, result: BacktestResult) -> BacktestMetricRes
     )
 
 
+# 汇总数据库快照、日历、证券范围和规则／辅助数据来源，记录近似或补齐数据的身份。
 def _provenance(
     config: BacktestConfig,
     dataset: QmtDailyDataset,
@@ -388,10 +364,13 @@ def _provenance(
     }
 
 
+# 提取模型训练与预测相关元数据，供实验结果留档。
 def _model_metadata(
     runtime: _ModelRuntime, components: LoadedModelComponents
 ) -> Mapping[str, object]:
-    return {
+    fit_summary = dict(runtime.result.fit_summary)
+    payload: dict[str, object] = {
+        "backend": components.settings.backend,
         "bundle": runtime.result.bundle.metadata.to_dict(),
         "source_path": components.source_path,
         "source_sha256": components.source_sha256,
@@ -399,175 +378,32 @@ def _model_metadata(
         "train_sample_count": runtime.sample_counts[0],
         "validation_sample_count": runtime.sample_counts[1],
         "test_sample_count": runtime.sample_counts[2],
-        "best_epoch": runtime.result.best_epoch,
-        "epochs_trained": runtime.result.epochs_trained,
-        "best_validation_loss": runtime.result.best_validation_loss,
+        "fit_summary": fit_summary,
         "validation_metrics": asdict(runtime.result.validation_metrics),
         "test_metrics": asdict(runtime.result.test_metrics),
-        "scaler_fit_scope": "TRAIN_ONLY",
     }
+    if components.settings.backend == "torch":
+        payload.update(
+            {
+                "best_epoch": fit_summary["best_epoch"],
+                "epochs_trained": fit_summary["epochs_trained"],
+                "best_validation_loss": fit_summary["best_validation_loss"],
+                "scaler_fit_scope": "TRAIN_ONLY",
+            }
+        )
+    return payload
 
 
+# 用策略类型、UTC 时间和随机后缀生成本次运行标识。
 def _run_id(case: str) -> str:
     stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%S")
     return f"{stamp}-{case}-{uuid4().hex[:8]}"
 
 
-def run_experiment(
-    experiment_path: Path,
-    *,
-    system_path: Path = _DEFAULT_SYSTEM_CONFIG,
-    project_root: Path = _PROJECT_ROOT,
-) -> dict[str, object]:
-    """Run exactly one strategy and atomically publish its fixed result set."""
-
-    root = Path(project_root).resolve()
-    prepared = prepare_experiment(
-        experiment_path,
-        system_path=system_path,
-        project_root=root,
-        require_password=True,
-    )
-    config = prepared.experiment.build_case(
-        prepared.system,
-        strategy=_strategy_config(prepared),
-    )
-    runs_dir = (root / config.runs_dir).resolve()
-    if not runs_dir.is_relative_to(root):
-        raise ValueError("runs_dir must stay inside the project")
-    run_id = _run_id(prepared.experiment.case)
-    writer = BacktestOutputWriter(runs_dir)
-    metadata: dict[str, object] = {
-        "name": prepared.experiment.name,
-        "case": prepared.experiment.case,
-        "experiment_path": prepared.source_path,
-        "experiment_sha256": _sha256(prepared.source_path),
-        "system_path": Path(system_path).resolve(strict=True),
-        "resolved_config": config.resolved_dict(),
-        "rule_source_sha256": prepared.rule_source_sha256,
-    }
-    sql_engine: Engine | None = None
-    try:
-        sql_engine = _database_engine(config.database)
-        repository = _repository(config, sql_engine)
-        universe = _resolve_universe(config, repository)
-        dataset = repository.load_daily_dataset(
-            universe.symbols,
-            _load_start(prepared),
-            config.end_date,
-            etf_infos=universe.etf_infos,
-        )
-        portal = DailyDataPortal(dataset)
-        rule_resolver = load_effective_rule_resolver(
-            universe.etf_infos,
-            _required_resource(config.limit_rules_csv, root, "limit rule CSV"),
-            _required_resource(config.limit_rules_manifest, root, "limit rule manifest"),
-        )
-        account = Account(
-            cash=config.initial_cash,
-            positions={
-                info.symbol: Position(
-                    symbol=info.symbol,
-                    turnover_rule=rule_resolver.resolve(
-                        info.symbol,
-                        max(config.start_date, info.list_date),
-                    ).turnover_rule,
-                )
-                for info in universe.etf_infos
-            },
-        )
-        model_runtime: _ModelRuntime | None = None
-        strategy: BaseStrategy
-        if prepared.rule is not None:
-            strategy = SimpleRuleStrategy(rule=prepared.rule)
-        else:
-            assert prepared.model is not None
-            model_runtime = _build_model(
-                config,
-                prepared.model,
-                dataset.front_market_bar_views(),
-            )
-            strategy = model_runtime.strategy
-        fill_model = FillModel(
-            fee_model=FeeModel(config.fee),
-            slippage_model=SlippageModel(config.slippage),
-        )
-        result = BacktestEngine(
-            portal=portal,
-            account=account,
-            strategy=strategy,
-            rule_resolver=rule_resolver,
-            rule_engine=EtfRuleEngine(
-                fill_model=fill_model,
-                volume_participation_rate=config.volume_participation_rate,
-            ),
-            order_generator=OrderGenerator(),
-            fill_model=fill_model,
-        ).run(start_date=config.start_date, end_date=config.end_date)
-        expected_dates = portal.trading_calendar.trading_dates(config.start_date, config.end_date)
-        if tuple(row.trade_date for row in result.daily_snapshots) != expected_dates:
-            raise RuntimeError("daily NAV does not exactly cover configured SSE dates")
-        calculated_metrics = _metrics(config.initial_cash, result)
-        daily_rows = tuple(
-            DailyMetricRow(row.trade_date, row.cash, row.market_value, row.total_asset)
-            for row in result.daily_snapshots
-        )
-        metadata["provenance"] = _provenance(
-            config,
-            dataset,
-            portal,
-            universe,
-            rule_resolver,
-        )
-        metadata["rule_settings"] = (
-            prepared.rule.settings.resolved_dict() if prepared.rule is not None else None
-        )
-        plots = render_backtest_plots(initial_cash=config.initial_cash, daily_rows=daily_rows)
-        if model_runtime is None:
-            run_dir = writer.write_success(
-                run_id=run_id,
-                run_metadata=metadata,
-                result=result,
-                metrics=calculated_metrics,
-                plots=plots,
-            )
-        else:
-            assert prepared.model is not None
-            metadata["model"] = _model_metadata(model_runtime, prepared.model)
-            with TemporaryDirectory(prefix="qmt-model-bundle-") as temp_directory:
-                bundle_path = model_runtime.workflow.save(Path(temp_directory) / "model_bundle.pt")
-                run_dir = writer.write_success(
-                    run_id=run_id,
-                    run_metadata=metadata,
-                    result=result,
-                    metrics=calculated_metrics,
-                    plots=plots,
-                    model_artifacts=ModelArtifacts(
-                        bundle_path=bundle_path,
-                        predictions=prediction_rows(model_runtime.strategy.predictions),
-                    ),
-                )
-        return {
-            "status": "success",
-            "experiment": prepared.experiment.name,
-            "case": prepared.experiment.case,
-            "run_id": run_id,
-            "run_dir": str(run_dir),
-            "daily_count": len(result.daily_snapshots),
-            "order_count": len(result.orders),
-            "trade_count": len(result.fills),
-        }
-    except Exception as exc:
-        writer.write_failure(run_id=run_id, run_metadata=metadata, error=exc)
-        raise
-    finally:
-        if sql_engine is not None:
-            sql_engine.dispose()
 
 
 __all__ = [
-    "PreparedExperiment",
+    "StrategySource",
     "prepare_experiment",
     "run_experiment",
-    "validate_experiment",
 ]

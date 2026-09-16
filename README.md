@@ -1,238 +1,73 @@
-# QMT 日频 ETF 回测项目
+# ETF 日频回测与 MiniQMT 模拟盘
 
-本项目从 MySQL 只读加载 QMT 日频数据，在本地完成策略计算、模型训练、回测和结果输出。
-每位用户使用自己的 MySQL 账号连接同一个 `qmt_etf_quant` 数据库即可；回测不会修改数据库。
+项目只保留两个运行入口。使用目标电脑原有 Python 环境、MySQL 数据、MiniQMT 账户及配置。
 
-项目提供两种自定义入口：
+阅读代码可先看 [核心流程阅读指南](docs/核心流程阅读指南.md)，按回测主线、策略接口和模拟盘闭环进入关键函数；需要查找具体定义时使用 [类与函数索引](docs/类与函数索引.md)。业务代码中的类和函数已有中文作用说明，测试代码保持原样。
 
-- **Rule**：编辑 Python 规则，根据行情、持仓、ETF 份额、汇金持有比例或指数数据返回目标权重；
-- **Model**：编辑特征、PyTorch 网络、训练参数和 Top-K 组合规则。
+## 1. 回测
 
-汇金策略只是随项目提供的一个示例，不是固定运行入口。用户可以创建任意多个独立实验，分别
-选择自己的证券池、回测区间以及 Rule 或 Model。
-
-## 1. 环境要求与安装
-
-需要 Python 3.12。在项目根目录执行：
+在项目根目录运行：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -e ".[deep]"
+python run_backtest.py private_strategy/beginner_example/experiment.yaml
 ```
 
-`deep` 会安装 Model 所需的 PyTorch。只运行 Rule 时可以使用：
+更换实验配置路径即可运行其他 Rule 或 Model。也可以在 IDE 中直接运行 `run_backtest.py`，
+使用其中的 `EXPERIMENT_PATH`。可选 `--system` 指定系统配置；默认仍为
+`qmt_example/configs/system.yaml`。
+
+实验 YAML 设置日期、资金、证券池和 `case: rule/model`；策略逻辑在同目录 `rule.py` 或
+`model.py`。新建策略时复制一个现有示例目录后编辑，不需要单独的创建命令。
+
+Rule 根据前复权行情及只读持仓、份额、汇金、指数数据返回目标权重。Model 支持 Torch 和
+XGBoost，一次回测训练一次，再逐日预测并分配组合。两者共用 D+1 收盘执行、交易规则及账户核算。
+
+模型设备在各策略 `model.py` 的 `TorchTrainingConfig` 或 `XGBoostTrainingConfig` 中选择：
+`device="cpu"`（默认）、`device="cuda"` 或 `device="cuda:0"`。模拟盘通过 YAML 的
+`strategy.model.device` 独立选择推理设备。具体示例见 [Model 设备配置](docs/MODEL_API.md#选择-cpu-或-gpu)。
+
+结果保存在系统配置的 `runs_dir` 中，每次生成新目录，包括净值、持仓、订单、成交、指标、
+最终账户及收益/回撤/现金图。Model 另保存 `predictions.csv` 和 `.pt` 或 `.ubj` 模型文件。
+
+## 2. 模拟盘每日自动运行
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -e .
+python run_paper_trading.py --config qmt_example/configs/live/xgboost_example_paper.yaml
 ```
 
-## 2. 配置自己的 MySQL 账号
+配置使用 `config_version: "4.0"`，一个 `strategy` 对象选择 Rule 或 Model。
+`strategy.initial_capital` 是策略初始本金；现金、持仓及未成交订单预留独立记账，
+下单只检查策略额度，不查询券商可用现金。旧版 `strategies`、`enabled`、资金池配置已删除。
+Model 使用配置指定的固定模型文件；从回测结果复制模型到已有配置指定的位置即可。
 
-编辑 [`qmt_example/configs/system.yaml`](qmt_example/configs/system.yaml)：
+进程保持运行后，按配置和交易日历自动完成：
 
-```yaml
-database:
-  host: 数据库服务器地址
-  port: 3306
-  database: qmt_etf_quant
-  user: 你的只读用户名
-  password_env: QMT_MYSQL_PASSWORD
-```
+1. 收盘后生成下一交易日使用的信号。
+2. 下一交易日按既定时间连接 MiniQMT、恢复对账，先卖后买，核实成交并处理撤单。
+3. 日终对账，保存该策略现金、持仓和资产快照。
 
-在当前 PowerShell 进程设置密码：
+首次启动必须在所需信号日的信号时间之前保持运行，或数据库中已存在对应待执行目标；
+系统不会为了追赶启动时间而补造昨日信号，也不会在停止新单时间之后开启新批次。
+Ctrl+C 停止进程；运行中的券商会话和账户锁由原生命周期逻辑释放。再次启动沿用既有记录恢复。
 
-```powershell
-$env:QMT_MYSQL_PASSWORD = "你的密码"
-```
+数据库表与现有记录沿用目标电脑现状。程序不提供建表、升级、迁移或清库命令；正常自动交易
+仍按原逻辑读写既有 `live_*` 状态表，历史行情表只读。密码、连接参数、调度时间和依赖保持原样。
+本程序需保持进程运行；不安装 Windows 定时任务或自动开机服务。
 
-如果内部环境明确允许把密码写进本地配置，也可以删除 `password_env`，改成：
+同一账户已有同一策略账本时直接恢复；已有其他策略账本则拒绝启动，避免重新发放本金。
+切换策略 ID 前先结束旧策略及未完成订单，再使用独立状态库；详见开发说明中的单策略资金约定。
 
-```yaml
-  password: "你的密码"
-```
+## 配置与代码位置
 
-账号只需要对项目配置的 `qmt_etf_quant` 数据表拥有 `SELECT` 权限。MySQL 提供原始行情、
-前复权行情、交易状态、ETF 份额、指数行情和 ETF 主数据；项目不会建表、更新或删除数据。
-公开的汇金数据已经放在 `resources/huijin/huijin_combined.csv`，无需额外下载。
+| 内容 | 位置 |
+|---|---|
+| MySQL、费用、滑点、资源与输出目录 | `qmt_example/configs/system.yaml` |
+| 模拟盘账户、策略资金、模型路径、调度与风控 | `qmt_example/configs/live/*.yaml` |
+| 策略与实验配置 | `private_strategy/<策略>/` |
+| 模拟盘组件装配 | `etf_backtest/live/service.py` |
+| 自动调度与业务执行 | `etf_backtest/live/engine.py`、`scheduler.py`、`jobs.py` |
 
-## 3. 创建自己的实验
+Rule 接口见 [RULE_API.md](docs/RULE_API.md)，Model 接口见 [MODEL_API.md](docs/MODEL_API.md)。
+维护位置见 [README_DEVELOPER.md](README_DEVELOPER.md)。
 
-### 使用命令创建
-
-```powershell
-.\.venv\Scripts\python.exe -m qmt_example new experiment my_strategy
-```
-
-生成：
-
-```text
-private_strategy/my_strategy/
-├── experiment.yaml
-├── rule.py
-└── model.py
-```
-
-脚手架不会覆盖已有实验。
-
-### 不使用命令创建
-
-在 PyCharm、VS Code 或文件管理器中复制：
-
-```text
-private_strategy/beginner_example/
-```
-
-将副本重命名为自己的策略名称，然后编辑其中三个文件即可。不要直接运行 `rule.py` 或
-`model.py`，它们由回测入口根据 `experiment.yaml` 动态加载。
-
-## 4. 设置回测范围和策略类型
-
-编辑自己实验目录中的 `experiment.yaml`：
-
-```yaml
-name: my_strategy
-start_date: 2024-01-01
-end_date: 2024-12-31
-initial_cash: "1000000"
-
-# 每次实验只运行一种类型：rule 或 model。
-case: rule
-
-universe:
-  symbols: [SH.510300, SH.518880, SH.588000]
-  pools: []
-```
-
-- `case` 只能是 `rule` 或 `model`；
-- 证券代码支持 `SH.510300`、`510300.SH` 或 `510300`；
-- 资产池支持 `domestic_stock_etf`、`gold_etf`、`all_supported_etf`；
-- `symbols` 与 `pools` 可以同时填写，系统取并集；
-- Decimal 参数建议写成带引号的文本，避免 YAML 浮点误差。
-
-## 5. 编辑 Rule
-
-当 `case: rule` 时，编辑同目录的 `rule.py`。核心入口是：
-
-```python
-class Strategy(UserRule):
-    settings = RuleSettings(
-        lookback_trading_days=21,
-        rebalance_every_trading_days=20,
-        target_weight="0.90",
-        parameters={"momentum_period": 20},
-    )
-
-    def generate_weights(self, data: RuleMarketData):
-        return {"SH.510300": self.target_weight}
-```
-
-Rule 返回完整的目标权重，不直接创建订单或修改账户。系统会在 D+1 合法交易日收盘尝试执行，
-并统一处理停牌、涨跌停、整手、成交量上限、T+0/T+1、现金、费用和滑点。
-
-- `NO_REBALANCE`：本次不创建新目标，保持现状；
-- `{}`：目标组合全部持有现金；
-- 未返回的证券：目标权重为 0。
-
-全部字段、函数、返回值和示例见 [Rule 策略接口手册](docs/RULE_API.md)。普通入门示例见
-[`private_strategy/beginner_example/rule.py`](private_strategy/beginner_example/rule.py)，汇金多 ETF
-示例见 [`private_strategy/huijin_multi_example/rule.py`](private_strategy/huijin_multi_example/rule.py)。
-
-## 6. 编辑 Model
-
-当 `case: model` 时，编辑同目录的 `model.py`。文件需要提供：
-
-- `MODEL_SETTINGS`：训练集、验证集、训练参数、组合参数及构造参数；
-- `class Features(FeatureBuilder)`：特征名称、历史长度和特征计算；
-- `class Model(TorchModelFactory)`：模型身份、重建参数和 PyTorch 网络。
-
-回测测试区间使用 `experiment.yaml` 的起止日期。训练区间和验证区间在 `MODEL_SETTINGS` 中
-设置，必须早于回测开始日且互不重叠。框架只用训练集拟合标准化器，一次运行只训练一次，
-不会在回测过程中重新训练。
-
-完整接口说明见 [Model 策略接口手册](docs/MODEL_API.md)，可编辑示例见
-[`private_strategy/beginner_example/model.py`](private_strategy/beginner_example/model.py)。
-
-## 7. 运行回测
-
-### 命令行运行
-
-```powershell
-.\.venv\Scripts\python.exe -m qmt_example run private_strategy/my_strategy/experiment.yaml
-```
-
-也可以使用安装后的命令：
-
-```powershell
-qmt-etf-backtest run private_strategy/my_strategy/experiment.yaml
-```
-
-### 在 IDE 中点击运行
-
-使用 PyCharm 或 VS Code 打开项目根目录，编辑 [`run_backtest.py`](run_backtest.py) 中的路径：
-
-```python
-EXPERIMENT_PATH = PROJECT_ROOT / "private_strategy" / "my_strategy" / "experiment.yaml"
-```
-
-然后直接运行 `run_backtest.py`。如果使用 `password_env`，需要在 IDE 的运行配置中设置
-`QMT_MYSQL_PASSWORD`。IDE 工作目录应为项目根目录。实际运行 Rule 还是 Model，仍由所选
-实验的 `case` 决定。
-
-### 可选预检
-
-`validate` 不是运行回测的必要步骤。第一次配置数据库、修改证券池或只想检查连接时可以执行：
-
-```powershell
-.\.venv\Scripts\python.exe -m qmt_example validate private_strategy/my_strategy/experiment.yaml
-```
-
-它只检查配置、策略文件、MySQL 连接、必需表和显式证券，不执行策略，也不产生正式回测结果。
-
-## 8. 查看结果
-
-每次运行都会在 `qmt_example/results/user_experiments/<run_id>/` 创建一个全新的结果目录，不会
-覆盖旧结果。普通成功运行包含：
-
-```text
-run.json
-daily_nav.csv
-daily_positions.csv
-orders.csv
-trades.csv
-metrics.json
-final_account.json
-cumulative_return.png
-drawdown.png
-cash.png
-```
-
-- `run.json`：运行状态、配置摘要、数据版本和追溯信息；密码会被隐藏；
-- `daily_nav.csv`：每日现金、市值和总资产；
-- `daily_positions.csv`：每日全部证券的持仓、价格、市值和权重；
-- `orders.csv`：全部订单，包括未成交和被拒绝的订单；
-- `trades.csv`：实际正式成交；
-- `metrics.json`：收益、回撤、夏普、费用、滑点和换手等指标；
-- `final_account.json`：最终现金与持仓；
-- 三张 PNG：累计收益、回撤和现金曲线。
-
-Model 运行还会保存 `model_bundle.pt` 和 `predictions.csv`。失败运行只保留标记为失败的
-`run.json`，不会留下看似完整的净值、指标或图表。
-
-## 9. 数据口径提示
-
-- Rule 和 Model 计算信号、特征时读取等比前复权日行情；
-- 成交、估值和账户记账由框架内部使用原始未复权行情；
-- D 日收盘形成目标，最早在 D+1 合法交易日收盘尝试成交；
-- 当前数据属于统一冻结的回填快照，不应解释为历史每一天当时可获得的严格 PIT 数据。
-
-## 10. 更多文档
-
-- [Rule 策略接口手册](docs/RULE_API.md)
-- [Model 策略接口手册](docs/MODEL_API.md)
-- [项目整体框架与开发说明](README_DEVELOPER.md)
-
-## 11. 许可证
-
-本项目采用 [MIT License](LICENSE)，版权归 `Str_lab`。在保留许可证和版权声明的前提下，
-可以使用、修改、发布和再分发本项目。
+本项目采用 [MIT License](LICENSE)。

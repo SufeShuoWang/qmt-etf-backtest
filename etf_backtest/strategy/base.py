@@ -1,4 +1,4 @@
-"""Target-only daily strategy interface."""
+"""只生成目标组合的日频策略接口。"""
 
 from __future__ import annotations
 
@@ -13,17 +13,18 @@ from etf_backtest.strategy.context import AccountView, StrategyContext
 
 
 class BaseStrategy(ABC):
-    """Validate that strategies see only completed front-adjusted views."""
+    """确保策略只能看到已经完成的前复权视图。"""
 
     @abstractmethod
     def should_generate_target(self, frame_index: int) -> bool:
-        """Return whether this signal frame is on the strategy schedule."""
+        """返回当前信号行情帧是否位于策略调度日。"""
 
     @property
     @abstractmethod
     def required_history_trading_days(self) -> int:
-        """Return the preferred front-view lookback supplied by the engine."""
+        """返回希望引擎提供的前复权视图回看长度。"""
 
+    # 策略统一入口：核对日期、账户上下文及历史行情边界，再调用子类计算目标并检查返回类型。
     @final
     def generate_target(
         self,
@@ -64,6 +65,7 @@ class BaseStrategy(ABC):
             raise TypeError("strategy must return TargetPortfolio or NoRebalance")
         return target
 
+    # 定义子类必须实现的目标计算步骤；输入已由 generate_target() 检查。
     @abstractmethod
     def _generate_target(
         self,

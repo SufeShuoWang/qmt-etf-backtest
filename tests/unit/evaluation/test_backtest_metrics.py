@@ -1,4 +1,4 @@
-"""Fixed-formula and boundary tests for dynamic backtest metrics."""
+"""动态回测指标的固定公式和边界测试。"""
 
 from datetime import date
 from decimal import Decimal

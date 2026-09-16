@@ -1,4 +1,4 @@
-"""ETF fee calculations stay Decimal and per fill."""
+"""ETF 费用保持 Decimal 并按成交逐笔计算的测试。"""
 
 from decimal import Decimal
 

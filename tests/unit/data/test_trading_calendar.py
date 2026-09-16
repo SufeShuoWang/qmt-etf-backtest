@@ -1,4 +1,4 @@
-"""Frozen natural-date SSE daily calendar contract."""
+"""冻结自然日期上交所日频日历契约。"""
 
 from __future__ import annotations
 

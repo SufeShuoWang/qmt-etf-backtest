@@ -1,1 +1,1 @@
-"""Project test package used to give fixture modules unique import names."""
+"""项目测试包，用于为 fixture 模块提供唯一导入名称。"""

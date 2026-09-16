@@ -1,4 +1,4 @@
-"""Framework-neutral model contract and daily alignment tests."""
+"""与具体框架无关的模型契约和日频对齐测试。"""
 
 from __future__ import annotations
 

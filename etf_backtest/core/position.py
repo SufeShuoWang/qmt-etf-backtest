@@ -1,26 +1,20 @@
-"""Immutable T+0/T+1 ETF holding state."""
+"""不可变的 ETF T+0/T+1 持仓状态。"""
 
 from __future__ import annotations
+
 
 from dataclasses import dataclass, replace
 from decimal import Decimal
 
+from etf_backtest.validation import quantity as _quantity
 from etf_backtest.config.schema import normalize_symbol
 from etf_backtest.core.market import TurnoverRule
 from etf_backtest.core.order import FillResult, OrderSide
 
 
-def _quantity(value: object, field_name: str) -> int:
-    if type(value) is not int:
-        raise TypeError(f"{field_name} must be an integer")
-    if value < 0:
-        raise ValueError(f"{field_name} must be non-negative")
-    return value
-
-
 @dataclass(frozen=True, slots=True)
 class Position:
-    """One registered ETF position with explicit sellable-share buckets."""
+    """单个已登记 ETF 持仓，明确区分可卖份额分桶。"""
 
     symbol: str
     turnover_rule: TurnoverRule
@@ -28,6 +22,7 @@ class Position:
     available_quantity: int = 0
     today_buy_quantity: int = 0
 
+    # 检查总持仓、可卖持仓和当日买入数量与周转规则一致。
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
         if not isinstance(self.turnover_rule, TurnoverRule):
@@ -43,6 +38,7 @@ class Position:
         elif available + today != total:
             raise ValueError("T1 available and today buckets must sum to total")
 
+    # 增加买入数量；T+0 可立即卖出，T+1 买入先计入当日不可卖部分。
     def apply_buy(self, fill: FillResult) -> Position:
         if not isinstance(fill, FillResult):
             raise TypeError("position updates require a formal FillResult")
@@ -61,6 +57,7 @@ class Position:
             today_buy_quantity=self.today_buy_quantity + fill.fill_quantity,
         )
 
+    # 扣减允许卖出的持仓数量，返回更新后的不可变持仓对象。
     def apply_sell(self, fill: FillResult) -> Position:
         if not isinstance(fill, FillResult):
             raise TypeError("position updates require a formal FillResult")
@@ -75,7 +72,7 @@ class Position:
         )
 
     def on_new_trade_date(self) -> Position:
-        """Release T+1 purchases exactly once at the next engine date."""
+        """在引擎进入下一交易日时仅释放一次 T+1 买入份额。"""
 
         if self.turnover_rule is TurnoverRule.T0 or self.today_buy_quantity == 0:
             return self
@@ -85,6 +82,7 @@ class Position:
             today_buy_quantity=0,
         )
 
+    # 用给定原始价格计算该证券持仓市值。
     def market_value(self, raw_close: Decimal) -> Decimal:
         if not isinstance(raw_close, Decimal):
             raise TypeError("raw_close must be Decimal")
@@ -92,6 +90,7 @@ class Position:
             raise ValueError("raw_close must be finite and positive")
         return raw_close * self.total_quantity
 
+    # 判断总持仓数量是否为零。
     @property
     def is_empty(self) -> bool:
         return self.total_quantity == 0

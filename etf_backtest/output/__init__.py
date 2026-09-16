@@ -1,4 +1,4 @@
-"""Fixed local artifacts for completed backtests."""
+"""已完成回测的固定本地结果文件。"""
 
 from etf_backtest.output.writer import BacktestOutputWriter, ModelArtifacts
 

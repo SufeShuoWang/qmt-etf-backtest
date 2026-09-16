@@ -1,0 +1,261 @@
+{
+  "daily_count": 242,
+  "metadata": {
+    "case": "model",
+    "experiment_path": "D:/etf_backtest/main_backtest/private_strategy/xgboost_example/experiment.yaml",
+    "experiment_sha256": "37ee91ee619f4d28109ef349338f806ac70b16ea918b25c162845e48621e6ee7",
+    "model": {
+      "backend": "xgboost",
+      "bundle": {
+        "data_identity": {
+          "dataset_version": "qmt_etf_quant_20260812",
+          "manifest_sha256": "39502872c5544cbf4dc1671ea67488479021e39db97f34aecdedf1bc56cc62a7",
+          "snapshot_started_at_utc": "2026-08-12T08:48:57+00:00"
+        },
+        "feature_fingerprint": "34df1f7168051eeaa9e14ae70fc8fb1142e7563291412d215a00320d497b8bc3",
+        "feature_names": [
+          "return_5d",
+          "return_20d",
+          "volume_ratio_5_20"
+        ],
+        "framework_name": "xgboost",
+        "framework_version": "3.4.1",
+        "label_name": "front_close[D+2]/front_close[D+1]-1",
+        "model_class_name": "Model",
+        "model_id": "xgboost_three_factor_v1",
+        "model_parameters_json": "{\"colsample_bytree\":0.8,\"eta\":0.03,\"max_depth\":4,\"min_child_weight\":1,\"reg_alpha\":0.0,\"reg_lambda\":1.0,\"subsample\":0.8}",
+        "random_seed": 42,
+        "schema_version": "DAILY_MODEL_BUNDLE_V2",
+        "test_range": {
+          "end_date": "2024-12-31",
+          "start_date": "2024-01-01"
+        },
+        "train_range": {
+          "end_date": "2022-12-31",
+          "start_date": "2021-01-01"
+        },
+        "trained_through": "2022-12-30",
+        "training_parameters_json": "{\"booster\":\"gbtree\",\"device\":\"cpu\",\"early_stopping_metric\":\"valid/rmse\",\"early_stopping_rounds\":30,\"early_stopping_save_best\":true,\"eval_metric\":\"rmse\",\"min_delta\":0.0,\"nthread\":1,\"num_boost_round\":500,\"objective\":\"reg:squarederror\",\"seed\":42,\"tree_method\":\"hist\"}",
+        "valid_range": {
+          "end_date": "2023-12-31",
+          "start_date": "2023-01-01"
+        }
+      },
+      "fit_summary": {
+        "best_iteration": 0,
+        "best_validation_rmse": 0.0094739986084891,
+        "preprocessing": "NONE",
+        "rounds_evaluated": 31
+      },
+      "settings": {
+        "backend": "xgboost",
+        "feature_kwargs": {},
+        "model_kwargs": {},
+        "portfolio": {
+          "min_score": -1.0,
+          "softmax_temperature": 1.0,
+          "top_k": 2,
+          "total_weight": "0.90",
+          "type": "top_k",
+          "weighting": "softmax"
+        },
+        "train_range": {
+          "end_date": "2022-12-31",
+          "start_date": "2021-01-01"
+        },
+        "training": {
+          "booster": "gbtree",
+          "device": "cpu",
+          "early_stopping_metric": "valid/rmse",
+          "early_stopping_rounds": 30,
+          "early_stopping_save_best": true,
+          "eval_metric": "rmse",
+          "min_delta": 0.0,
+          "nthread": 1,
+          "num_boost_round": 500,
+          "objective": "reg:squarederror",
+          "seed": 42,
+          "tree_method": "hist"
+        },
+        "valid_range": {
+          "end_date": "2023-12-31",
+          "start_date": "2023-01-01"
+        }
+      },
+      "source_path": "D:/etf_backtest/main_backtest/private_strategy/xgboost_example/model.py",
+      "source_sha256": "9797cf315e6374769f719d411de9e853a77cb0ed878fd0fcb0a2f74e933c009c",
+      "test_metrics": {
+        "mean_absolute_error": 0.010302681450784605,
+        "mean_squared_error": 0.0003472743207981188,
+        "prediction_correlation": 0.049964606200337325,
+        "sample_count": 720
+      },
+      "test_sample_count": 720,
+      "train_sample_count": 1455,
+      "validation_metrics": {
+        "mean_absolute_error": 0.006952750749878209,
+        "mean_squared_error": 8.975664900476997e-05,
+        "prediction_correlation": -0.0486585925888883,
+        "sample_count": 726
+      },
+      "validation_sample_count": 726
+    },
+    "name": "xgboost_example",
+    "provenance": {
+      "calendar_policy": "SSE_FOR_ALL",
+      "calendar_source": "AKSHARE_SINA",
+      "calendar_version": "qmt_etf_quant_20260812",
+      "data_mode": "RETROSPECTIVE_SNAPSHOT",
+      "dataset_version": "qmt_etf_quant_20260812",
+      "input_manifest_sha256": "39502872c5544cbf4dc1671ea67488479021e39db97f34aecdedf1bc56cc62a7",
+      "loaded_derived_price_limit_count": 0,
+      "loaded_explicit_price_limit_count": 3061,
+      "loaded_huijin_ratio_record_count": 31,
+      "loaded_index_record_count": 1029,
+      "loaded_share_record_count": 3061,
+      "pit_compliant": false,
+      "rule_resource": {
+        "csv_sha256": "66a22abfc2ab24c17f84d644b90923908ef0d5af5f917be826eddeba518e37f9",
+        "manifest_sha256": "f0c75eb23e8e1cf7154de4fe7e79808f64caed32e0af5b4dc7a8b9c496c501ec",
+        "resource_name": "etf_price_limit_20pct",
+        "resource_version": "2026-08-04.3",
+        "rule_mode": "LATEST_SNAPSHOT_WITH_2020_SEED"
+      },
+      "snapshot_started_at_utc": "2026-08-12T08:48:57+00:00",
+      "status_only_suspension_carry_keys": [],
+      "universe": [
+        {
+          "current_status": "LISTED",
+          "dataset_version": "qmt_etf_quant_20260812",
+          "delist_date": "",
+          "delist_date_approximated": "false",
+          "effective_from": "2024-01-01",
+          "effective_to": "2024-12-31",
+          "exchange": "SSE",
+          "exclusion_reason": "",
+          "fund_type": "股票型",
+          "included": "true",
+          "list_date": "2012-05-28",
+          "name": "华泰柏瑞沪深300交易型开放式指数证券投资基金",
+          "pool_classification_approximated": "false",
+          "primary_category": "纯境内",
+          "sources": "explicit",
+          "symbol": "SH.510300"
+        },
+        {
+          "current_status": "LISTED",
+          "dataset_version": "qmt_etf_quant_20260812",
+          "delist_date": "",
+          "delist_date_approximated": "false",
+          "effective_from": "2024-01-01",
+          "effective_to": "2024-12-31",
+          "exchange": "SSE",
+          "exclusion_reason": "",
+          "fund_type": "其他",
+          "included": "true",
+          "list_date": "2013-07-29",
+          "name": "华安易富黄金交易型开放式证券投资基金",
+          "pool_classification_approximated": "false",
+          "primary_category": "纯境内",
+          "sources": "explicit",
+          "symbol": "SH.518880"
+        },
+        {
+          "current_status": "LISTED",
+          "dataset_version": "qmt_etf_quant_20260812",
+          "delist_date": "",
+          "delist_date_approximated": "false",
+          "effective_from": "2024-01-01",
+          "effective_to": "2024-12-31",
+          "exchange": "SSE",
+          "exclusion_reason": "",
+          "fund_type": "股票型",
+          "included": "true",
+          "list_date": "2020-11-16",
+          "name": "华夏上证科创板50成份交易型开放式指数证券投资基金",
+          "pool_classification_approximated": "false",
+          "primary_category": "纯境内",
+          "sources": "explicit",
+          "symbol": "SH.588000"
+        }
+      ],
+      "universe_approximation_flags": []
+    },
+    "resolved_config": {
+      "calendar_policy": "SSE_FOR_ALL",
+      "config_version": "0.2.0",
+      "data_snapshot": {
+        "data_mode": "RETROSPECTIVE_SNAPSHOT",
+        "dataset_version": "qmt_etf_quant_20260812",
+        "front_table": "etf_quote_qmt_front_ratio_daily",
+        "huijin_holders_csv": "resources\\huijin\\huijin_combined.csv",
+        "huijin_holders_csv_sha256": "62b2f7141b4a0e7c9666880906dc7d2e0a6c8d2d71f87949834f2b0a6d4d0ad1",
+        "index_table": "index_quote_daily",
+        "manifest_sha256": "39502872c5544cbf4dc1671ea67488479021e39db97f34aecdedf1bc56cc62a7",
+        "raw_table": "etf_quote_qmt_unadjusted_daily",
+        "rule_index_codes": [
+          "000001.SH"
+        ],
+        "share_table": "etf_share_daily",
+        "snapshot_date": "2026-08-12",
+        "snapshot_started_at_utc": "2026-08-12T08:48:57Z",
+        "trade_status_table": "etf_trade_status_daily"
+      },
+      "database": {
+        "charset": "utf8mb4",
+        "connect_timeout_seconds": 10,
+        "database": "qmt_etf_quant",
+        "host": "127.0.0.1",
+        "password": "***",
+        "password_env": "***",
+        "port": 3306,
+        "user": "root"
+      },
+      "end_date": "2024-12-31",
+      "fee": {
+        "commission_rate": "0.0003",
+        "minimum_commission": "5",
+        "stamp_duty_rate": "0"
+      },
+      "fixed_execution_price": "CLOSE",
+      "fixed_frequency": "1d",
+      "initial_cash": "1000000",
+      "limit_rules_csv": "resources\\limit_rules\\etf_price_limit_20pct.csv",
+      "limit_rules_manifest": "resources\\limit_rules\\manifest.json",
+      "pit_compliant": false,
+      "rule_mode": "LATEST_SNAPSHOT_WITH_2020_SEED",
+      "runs_dir": "qmt_example\\results\\user_experiments",
+      "signal_execution_lag": "NEXT_SSE_TRADING_DAY_CLOSE",
+      "slippage": {
+        "rate": "0.0005"
+      },
+      "start_date": "2024-01-01",
+      "strategy": {
+        "kind": "model",
+        "max_total_weight": "0.90",
+        "test_end": "2024-12-31",
+        "test_start": "2024-01-01",
+        "train_end": "2022-12-31",
+        "train_start": "2021-01-01",
+        "valid_end": "2023-12-31",
+        "valid_start": "2023-01-01"
+      },
+      "universe": {
+        "pools": [],
+        "symbols": [
+          "SH.510300",
+          "SH.518880",
+          "SH.588000"
+        ]
+      },
+      "volume_participation_rate": "0.20"
+    },
+    "rule_settings": null,
+    "rule_source_sha256": null,
+    "system_path": "D:/etf_backtest/main_backtest/qmt_example/configs/system.yaml"
+  },
+  "order_count": 470,
+  "run_id": "20260826T113630-model-cd707698",
+  "status": "success",
+  "trade_count": 470
+}

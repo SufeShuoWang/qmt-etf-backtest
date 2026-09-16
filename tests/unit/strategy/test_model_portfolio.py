@@ -1,4 +1,4 @@
-"""Framework-neutral Model portfolio-policy tests."""
+"""与具体框架无关的 Model 组合策略测试。"""
 
 from __future__ import annotations
 

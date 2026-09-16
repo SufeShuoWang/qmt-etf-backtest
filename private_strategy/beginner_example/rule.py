@@ -1,4 +1,3 @@
-# ruff: noqa: RUF002, RUF003
 """初学者 Rule 示例：每 20 个交易日选择 20 日动量最强的 ETF。
 
 用户可以做什么：
@@ -28,11 +27,12 @@ pre_close、成交额、ETF 名称/类别或未来行情。
 某个信号日可能没有当日行情，所以必须检查 ``latest.trade_date == data.signal_date``。
 
 返回值必须是“资产池内证券 -> 目标权重”的映射：单个权重在 0 到 1 之间，总和不超过 1；
-省略的证券目标权重为 0，空映射表示目标全部持币。不返回订单、买卖方向或交易份额。
+省略的证券不参与本次调仓且持有数量不变，显式零权重表示清仓对应证券，空映射表示本次
+不调仓。不返回订单、买卖方向或交易份额。
 权重可使用 Decimal、小数字符串、整数或有限 float，新手优先使用 Decimal/字符串；禁止
-负权重、杠杆和资产池外证券。目标权重是完整组合目标，不是增量买卖信号。
+负权重、杠杆和资产池外证券。每项权重是绝对目标权重，不是增量买卖信号。
 系统固定在 D+1 合法交易日收盘执行目标，并统一处理停牌、涨跌停、T+0/T+1、整手、
-成交量、SELL 优先、现金、费用和滑点。因此“目标全部持币”不保证当日一定全部成交清仓。
+成交量、SELL 优先、现金、费用和滑点。全部清仓必须为相关持仓显式返回零权重。
 """
 
 from __future__ import annotations
@@ -64,6 +64,7 @@ class Strategy(UserRule):
         },
     )
 
+    # 计算候选 ETF 的 20 日动量，最高分超过阈值时仅返回赢家目标；无候选或未过阈值不调仓，旧持仓不会自动清仓。
     def generate_weights(self, data: RuleMarketData) -> Mapping[str, WeightInput]:
         # parameters 是只读映射，适合保存周期、阈值和开关等个性化参数。
         period_value = self.parameters["momentum_period"]
@@ -85,8 +86,7 @@ class Strategy(UserRule):
             if momentum is not None:
                 scores.append((momentum, symbol))
 
-        # 无可用标的、或最高动量不为正时，返回空映射即目标全部为现金。
-        # 交易限制可能使实际持仓不能立即全部卖出。
+        # 无可用标的、或最高动量不为正时，返回空映射表示本次不调仓。
         if not scores:
             return {}
         best_score, winner = max(scores, key=lambda item: (item[0], item[1]))
@@ -94,5 +94,5 @@ class Strategy(UserRule):
             return {}
 
         # 也可以返回多只 ETF，例如 {symbol_a: "0.45", symbol_b: "0.45"}。
-        # 所有未返回的证券目标权重自动为 0。
+        # 未返回的证券保持现有数量；需要退出的证券必须显式返回零权重。
         return {winner: self.target_weight}

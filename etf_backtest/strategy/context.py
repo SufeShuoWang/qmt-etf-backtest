@@ -1,37 +1,28 @@
-"""Small price-free strategy context for the daily engine."""
+"""供日频引擎使用的不含价格信息的精简策略上下文。"""
 
 from __future__ import annotations
 
+
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 from types import MappingProxyType
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
+from etf_backtest.validation import plain_date as _plain_date, quantity as _quantity
 from etf_backtest.config.schema import normalize_symbol
 from etf_backtest.core.account import Account
 from etf_backtest.core.market import IndexBarView, TurnoverRule
 from etf_backtest.core.position import Position
 
-
-def _plain_date(value: object, field_name: str) -> date:
-    if isinstance(value, datetime) or not isinstance(value, date):
-        raise TypeError(f"{field_name} must be datetime.date")
-    return value
-
-
-def _quantity(value: object, field_name: str) -> int:
-    if type(value) is not int:
-        raise TypeError(f"{field_name} must be an integer")
-    if value < 0:
-        raise ValueError(f"{field_name} must be non-negative")
-    return value
+if TYPE_CHECKING:
+    from etf_backtest.data.portal import DailyDataPortal
 
 
 @dataclass(frozen=True, slots=True)
 class AccountPositionView:
-    """Immutable share buckets with no price or account mutator."""
+    """不含价格和账户修改器的不可变份额分桶。"""
 
     symbol: str
     turnover_rule: TurnoverRule
@@ -39,6 +30,7 @@ class AccountPositionView:
     available_quantity: int
     today_buy_quantity: int
 
+    # 校验只读持仓视图的数量及周转规则。
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
         if not isinstance(self.turnover_rule, TurnoverRule):
@@ -54,6 +46,7 @@ class AccountPositionView:
         elif available + today != total:
             raise ValueError("T1 position view buckets must sum to total")
 
+    # 从账户 Position 提取策略允许读取的不可变持仓字段。
     @classmethod
     def from_position(cls, position: Position) -> AccountPositionView:
         if not isinstance(position, Position):
@@ -69,11 +62,12 @@ class AccountPositionView:
 
 @dataclass(frozen=True, slots=True)
 class AccountView:
-    """Immutable cash/quantity state that intentionally contains no prices."""
+    """有意不包含价格的不可变现金与数量状态。"""
 
     cash: Decimal
     positions: Mapping[str, AccountPositionView]
 
+    # 校验现金和持仓映射并冻结副本，避免策略修改实际账户。
     def __post_init__(self) -> None:
         if not isinstance(self.cash, Decimal):
             raise TypeError("cash must be Decimal")
@@ -91,6 +85,7 @@ class AccountView:
             canonical[symbol] = value
         object.__setattr__(self, "positions", MappingProxyType(dict(sorted(canonical.items()))))
 
+    # 把回测账户转换为只读账户视图，交给信号上下文。
     @classmethod
     def from_account(cls, account: Account) -> AccountView:
         if not isinstance(account, Account):
@@ -106,7 +101,7 @@ class AccountView:
 
 @dataclass(frozen=True, slots=True)
 class StrategyContext:
-    """Known D/D+1 identity plus price-free account and position-weight views."""
+    """已知的 D/D+1 身份信息，以及不含价格的账户和持仓权重视图。"""
 
     signal_date: date
     execution_date: date
@@ -123,6 +118,28 @@ class StrategyContext:
         default_factory=dict
     )
 
+    @classmethod
+    def from_portal(
+        cls, *, portal: DailyDataPortal, signal_date: date, execution_date: date,
+        frame_index: int, symbols: tuple[str, ...], account_view: AccountView,
+        current_weights_by_symbol: Mapping[str, Decimal], lookback_trading_days: int,
+    ) -> StrategyContext:
+        """辅助数据在此组装并交给构造器校验，回测与模拟盘共用。"""
+        return cls(
+            signal_date=signal_date, execution_date=execution_date,
+            frame_index=frame_index, symbols=symbols, account_view=account_view,
+            current_weights_by_symbol=current_weights_by_symbol,
+            share_history_by_symbol=portal.share_history_through(signal_date, symbols=symbols),
+            huijin_ratios_by_symbol=portal.huijin_ratios_as_of(signal_date, symbols=symbols),
+            index_history_by_code=portal.index_history_through(
+                signal_date, lookback_trading_days=lookback_trading_days,
+            ),
+            combined_huijin_ratio_by_symbol=portal.combined_huijin_ratios_as_of(
+                signal_date, symbols=symbols,
+            ),
+        )
+
+    # 校验信号／执行日期、调度序号、证券与账户一致性，并冻结各类辅助数据。
     def __post_init__(self) -> None:
         signal = _plain_date(self.signal_date, "signal_date")
         execution = _plain_date(self.execution_date, "execution_date")
@@ -143,47 +160,22 @@ class StrategyContext:
         if set(canonical) != set(self.account_view.positions):
             raise ValueError("symbols must exactly cover registered account positions")
         object.__setattr__(self, "symbols", canonical)
-        object.__setattr__(
-            self,
-            "current_weights_by_symbol",
-            self._freeze_current_weights(
-                self.current_weights_by_symbol,
-                symbols=canonical,
-            ),
-        )
-        object.__setattr__(
-            self,
-            "share_history_by_symbol",
-            self._freeze_share_history(
-                self.share_history_by_symbol,
-                symbols=canonical,
-                signal_date=signal,
-            ),
-        )
-        object.__setattr__(
-            self,
-            "huijin_ratios_by_symbol",
-            self._freeze_huijin_ratios(
-                self.huijin_ratios_by_symbol,
-                symbols=canonical,
-                signal_date=signal,
-            ),
-        )
-        object.__setattr__(
-            self,
-            "index_history_by_code",
-            self._freeze_index_history(self.index_history_by_code, signal_date=signal),
-        )
-        object.__setattr__(
-            self,
-            "combined_huijin_ratio_by_symbol",
-            self._freeze_combined_huijin_ratios(
-                self.combined_huijin_ratio_by_symbol,
-                symbols=canonical,
-                signal_date=signal,
-            ),
-        )
+        validated = {
+            "current_weights_by_symbol": self._freeze_current_weights(
+                self.current_weights_by_symbol, symbols=canonical),
+            "share_history_by_symbol": self._freeze_share_history(
+                self.share_history_by_symbol, symbols=canonical, signal_date=signal),
+            "huijin_ratios_by_symbol": self._freeze_huijin_ratios(
+                self.huijin_ratios_by_symbol, symbols=canonical, signal_date=signal),
+            "index_history_by_code": self._freeze_index_history(
+                self.index_history_by_code, signal_date=signal),
+            "combined_huijin_ratio_by_symbol": self._freeze_combined_huijin_ratios(
+                self.combined_huijin_ratio_by_symbol, symbols=canonical, signal_date=signal),
+        }
+        for name, value in validated.items():
+            object.__setattr__(self, name, value)
 
+    # 校验证券当前权重并冻结映射；权重由调用方按原始价估值提供。
     @staticmethod
     def _freeze_current_weights(
         supplied: Mapping[str, Decimal],
@@ -213,6 +205,7 @@ class StrategyContext:
             raise ValueError("current weights must not sum to more than one")
         return MappingProxyType(dict(sorted(result.items())))
 
+    # 检查同报告期汇金比例汇总的证券、日期及数值，形成只读映射。
     @staticmethod
     def _freeze_combined_huijin_ratios(
         supplied: Mapping[str, tuple[date, Decimal]],
@@ -243,6 +236,7 @@ class StrategyContext:
             result[symbol] = (end_date, ratio)
         return MappingProxyType(dict(sorted(result.items())))
 
+    # 检查指数历史代码、日期顺序与信号日边界，形成只读行情序列。
     @staticmethod
     def _freeze_index_history(
         supplied: Mapping[str, tuple[IndexBarView, ...]],
@@ -273,6 +267,7 @@ class StrategyContext:
             histories[index_code] = bars
         return MappingProxyType(dict(sorted(histories.items())))
 
+    # 检查 ETF 份额历史的精确日期和数值，冻结供策略查询的数据。
     @staticmethod
     def _freeze_share_history(
         supplied: Mapping[str, Mapping[date, Decimal]],
@@ -308,6 +303,7 @@ class StrategyContext:
             histories[symbol] = MappingProxyType(dict(sorted(rows.items())))
         return MappingProxyType(histories)
 
+    # 检查各汇金主体报告期比例并冻结；此层不建立独立的披露日期档案。
     @staticmethod
     def _freeze_huijin_ratios(
         supplied: Mapping[str, Mapping[str, tuple[date, Decimal]]],

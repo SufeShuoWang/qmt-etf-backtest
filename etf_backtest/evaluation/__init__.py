@@ -1,1 +1,1 @@
-"""Backtest performance evaluation package."""
+"""回测绩效评价包。"""

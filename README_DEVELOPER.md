@@ -1,303 +1,291 @@
-# QMT 日频 ETF 回测项目：整体框架与开发说明
+# 项目维护说明
 
-本文档面向准备理解或修改核心框架的开发者。只需要填写 MySQL、编写 Rule/Model 并运行回测
-的用户，请先阅读 [普通用户使用说明](README.md)。
+## 先打开哪个文件
 
-## 1. 项目定位
+日常修改从你实际使用的 `private_strategy/<策略目录>/` 开始。回测命令的实验路径、
+模拟盘配置中的 `experiment_path` 决定使用哪个目录。
 
-这是一个 Python 3.12 日频 ETF 回测框架。生产数据从统一的 MySQL `qmt_etf_quant` 数据库
-只读加载，策略、模型训练、撮合、账户记账、指标和结果文件全部在本地完成。
-
-框架把“用户可以自由修改的研究逻辑”和“必须统一执行的交易与账户逻辑”分开：
-
-- 用户只在 `private_strategy/<实验名>/` 编辑证券池、Rule 或 Model；
-- 框架负责数据库读取、时序隔离、订单生成、交易规则、成交、账户和结果；
-- 汇金只是一个可选数据接口和示例策略，不是核心框架的固定路径。
-
-## 2. 当前能够实现的功能
-
-### 数据与证券池
-
-- 使用个人 MySQL 只读账号连接统一的 `qmt_etf_quant`；
-- 加载 ETF 原始未复权日行情、等比前复权日行情、交易状态、每日份额和 ETF 主数据；
-- 为 Rule 加载配置的指数日行情；
-- 从项目内 CSV 加载可选的汇金持有比例；
-- 使用显式证券列表、预定义 ETF 资产池或二者并集；
-- 根据上市/退市日期控制回测区间中的证券有效性；
-- 使用统一的上交所交易日历推进沪深 ETF 日频 Frame。
-
-### Rule 策略
-
-- 动态加载每个实验自己的 `rule.py`；
-- 自定义回看长度、调仓间隔、目标仓位和任意 JSON 兼容策略参数；
-- 读取截至信号日的前复权 OHLCV、停牌状态、现金和只读持仓；
-- 读取当前权重、ETF 每日份额、汇金比例及配置指数历史；
-- 返回多证券目标权重、全部持币目标或 `NO_REBALANCE`；
-- 支持选股、过滤、轮动、择时、多资产配置和空仓规则。
-
-### Model 策略
-
-- 动态加载每个实验自己的 `model.py`；
-- 自定义单证券时序特征和 PyTorch `nn.Module`；
-- 自定义训练/验证日期、随机种子、轮数、早停、batch、学习率和权重衰减；
-- 固定使用 D+1 到 D+2 的前复权收益标签；
-- 只用训练集拟合 StandardScaler；
-- 使用验证集早停，并在一次运行中只训练一次；
-- 通过等权、分数比例、Softmax 或受校验的自定义方法生成 Top-K 组合；
-- 保存模型 bundle、逐日预测和训练/验证/测试指标。
-
-### 交易、账户与输出
-
-- D 日收盘产生目标，最早在 D+1 合法交易日收盘成交；
-- 统一处理停牌、方向性涨跌停、T+0/T+1、整手和成交量上限；
-- 卖单先于买单，买单受现金、费用和滑点约束；
-- 保留全部订单，包括未成交和被拒绝订单；
-- 只有正式成交结果可以修改账户；
-- 每次运行创建新的结果目录，不覆盖既有结果；
-- 输出净值、持仓、订单、成交、指标、最终账户和图表；
-- 冻结非秘密配置、数据版本、资源摘要和策略/模型来源摘要，便于追溯。
-
-## 3. 当前不支持的功能边界
-
-- 不支持分钟、小时、Tick 或其他非日频周期；
-- 不支持开盘、VWAP、TWAP、盘中价格或其他成交时点，当前固定为收盘执行；
-- 不支持股票、债券、期货、期权、外汇和加密资产，当前证券域是境内股票 ETF 与黄金 ETF；
-- 不支持卖空、负权重、杠杆或目标总权重超过 1；
-- 不提供实时交易、券商下单、实盘账户同步或行情订阅；
-- 不提供图形化策略编辑器或 Web UI；
-- 不向 MySQL 写回回测结果，也不维护 MySQL 结果表；
-- 不负责下载、更新或维护服务器数据库；
-- 不提供内置参数搜索或自动调参入口；
-- 不把当前回填快照宣称为严格的逐日 PIT 数据；
-- Model 特征不读取账户、汇金、ETF 份额、指数或其他证券的横截面数据；需要这些信息时使用 Rule；
-- 当前公开入口每次重新训练 Model，不直接复用以前保存的 bundle。
-
-## 4. 项目目录结构
-
-```text
-main_backtest/
-├── README.md                         # 普通用户使用说明
-├── README_DEVELOPER.md               # 本文：整体框架与开发说明
-├── LICENSE                           # MIT License
-├── pyproject.toml                    # 安装依赖、命令入口及工具配置
-├── run_backtest.py                   # IDE 可直接运行的通用入口
-│
-├── etf_backtest/                     # 生产核心包
-│   ├── cli.py                        # new / validate / run 命令入口
-│   ├── experiment.py                 # 准备并编排一次 Rule/Model 实验
-│   ├── config/                       # 系统配置模型、校验和规范化
-│   ├── data/                         # MySQL Repository、日历和只读数据门户
-│   ├── universe/                     # 显式证券和资产池解析
-│   ├── strategy/                     # Rule、Model、加载器、调度和组合策略
-│   ├── core/                         # Frame、订单、交易规则、成交、账户和引擎
-│   ├── evaluation/                   # 回测指标和图表
-│   ├── output/                       # 结果目录的原子化写入
-│   └── experiments/                  # 实验 YAML 解析和新策略脚手架
-│
-├── qmt_example/
-│   ├── __main__.py                   # python -m qmt_example
-│   └── configs/system.yaml           # MySQL、数据表、交易和输出配置
-│
-├── private_strategy/
-│   ├── beginner_example/             # 普通 Rule/Model 入门示例
-│   └── huijin_multi_example/         # 多 ETF 汇金 Rule 示例
-│
-├── resources/
-│   ├── huijin/huijin_combined.csv    # 可公开的汇金持有比例
-│   └── limit_rules/                  # ETF 20% 涨跌幅例外资源及 manifest
-│
-├── docs/
-│   ├── RULE_API.md                   # Rule 完整用户接口
-│   ├── MODEL_API.md                  # Model 完整用户接口
-│   └── spec/
-│       └── QMT日频回测系统_唯一规范.md # 核心行为合同
-│
-└── tests/                            # 单元和回归测试
-```
-
-本地 `.venv/`、缓存、构建产物和 `qmt_example/results/` 不属于源码，由 `.gitignore` 排除。
-
-## 5. 整体数据流
-
-```mermaid
-flowchart LR
-    A["MySQL 只读数据<br/>raw / front / status / share / index / dim_etf"]
-    B["Repository<br/>查询、规范化、自然键配对"]
-    C["DailyDataPortal<br/>按日期截断的只读视图"]
-    D{"experiment.yaml<br/>case"}
-    E["Rule<br/>目标权重"]
-    F["Model<br/>特征、训练、预测、目标权重"]
-    G["OrderGenerator<br/>目标与实际持仓差异"]
-    H["EtfRuleEngine<br/>停牌、涨跌停、T+0/T+1、整手、成交量"]
-    I["FillModel<br/>原始收盘价、费用、滑点"]
-    J["Account<br/>现金与持仓"]
-    K["Output / Evaluation<br/>CSV、JSON、模型文件、图表"]
-
-    A --> B --> C
-    D --> E
-    D --> F
-    C --> E
-    C --> F
-    E --> G
-    F --> G
-    G --> H --> I --> J --> K
-    J -->|"下一交易日只读账户视图"| C
-```
-
-一次实验的编排入口是 `etf_backtest.experiment.run_experiment()`：
-
-1. 加载并校验系统配置、实验 YAML 和对应的 `rule.py` 或 `model.py`；
-2. 建立 MySQL 只读连接并解析证券池；
-3. 加载回测和必要回看区间的数据集；
-4. 创建日期截断的数据门户、账户和交易规则解析器；
-5. 运行 Rule，或训练一次 Model 后运行逐日预测；
-6. 将目标权重转换为订单并执行交易规则审批；
-7. 以原始收盘价、费用和滑点形成正式成交并更新账户；
-8. 计算指标和图表，并原子写入唯一结果目录。
-
-## 6. 核心模块职责
-
-| 模块 | 主要职责 | 不应承担的职责 |
+| 想修改什么 | 先打开哪里 | 修改位置 |
 |---|---|---|
-| `config` | 配置类型、字段校验、证券/指数代码规范化、秘密隐藏 | 查询数据库、运行策略 |
-| `data.mysql` | 只读 SQL、行映射、raw/front/status 配对、数据集构造 | 策略判断、账户修改 |
-| `data.calendar` | SSE 日历和回测交易日序列 | 猜测证券交易状态 |
-| `data.portal` | 向引擎提供按 D 日截断的数据视图 | 暴露未来数据、执行订单 |
-| `universe` | 解析显式证券、资产池和上市生命周期 | 生成策略权重 |
-| `strategy.rule` | Rule 用户接口、动态目标权重和调仓调度 | 直接修改账户或生成成交 |
-| `strategy.model*` | 特征合同、数据切分、训练、预测和组合权重 | 读取账户或自行下单 |
-| `core.order_generator` | 将目标权重与当前账户差异转换为候选订单 | 决定最终可成交数量 |
-| `core.etf_rules` | 决定订单批准数量及拒绝原因 | 绕过正式成交修改账户 |
-| `core.fill` | 计算成交价、费用、滑点和正式成交结果 | 产生策略信号 |
-| `core.account` | 通过正式成交维护现金和持仓 | 读取数据库或选择证券 |
-| `core.engine` | 按 Frame 编排信号、pending、成交和快照 | 包含用户专属策略逻辑 |
-| `evaluation` | 从回测结果计算指标和图表 | 改写回测状态 |
-| `output` | 原子写入新的运行目录并记录追溯信息 | 覆盖旧运行或写入 MySQL |
-| `experiment` | 组装以上组件并运行一个实验 | 固定汇金或其他具体策略 |
+| 回测起止日期、初始资金、证券池、规则/模型模式 | 策略目录的 `experiment.yaml` | `start_date`、`end_date`、`initial_cash`、`universe`、`case` |
+| 规则策略的买卖条件 | 策略目录的 `rule.py` | `Strategy.generate_weights()` |
+| 规则策略回看长度、调仓周期、目标仓位、常量 | 同一个 `rule.py` | `RuleSettings` |
+| 模型特征、特征顺序、历史长度 | 策略目录的 `model.py` | `Features.build_features()`、`feature_names`、`required_history_trading_days` |
+| 模型结构和参数 | 同一个 `model.py` | `Model`；Torch 的网络定义在 `create()` |
+| 训练区间、训练参数、预测后的组合分配 | 同一个 `model.py` | `ModelSettings` 及其 training、portfolio 设置 |
+| 模拟盘单个策略、虚拟资金、模型路径、运行时刻 | 实际传给模拟盘命令的 YAML | `strategy`、`signal`、`execution`、`eod` |
 
-## 7. Rule 与 Model 的区别
+改特征、模型结构或与模型绑定的组合参数后，先通过回测生成相匹配的模型文件，
+再让模拟盘配置指向它；模拟盘不会自动训练模型。具体命令见 [README.md](README.md)。
 
-| 项目 | Rule | Model |
+## 配置怎样传到运行代码
+
+回测和模拟盘信号计算共用 `application/strategy_source.py → build_backtest_config()`：
+先从 `rule.py` 或 `model.py` 转换策略参数，再调用
+`experiments/config.py → UserExperimentConfig.build_case()` 合并实验与系统设置。
+两个运行入口不再各写一遍合并过程，回测准备阶段也不重复构建策略参数。
+
+| 参数类别 | 修改来源 | 最终使用位置 |
 |---|---|---|
-| 用户编辑文件 | `rule.py` | `model.py` |
-| 核心定义 | `Strategy(UserRule)` | `MODEL_SETTINGS`、`Features`、`Model` |
-| 决策方式 | 用户代码直接返回目标权重 | 训练网络产生分数，再由组合策略返回权重 |
-| 行情 | 截至 D 的前复权日行情 | 单证券截至 D 的前复权日行情 |
-| 账户与持仓 | 可读取只读现金、持仓和当前权重 | 不可读取 |
-| ETF 份额/汇金/指数 | 可读取 | 不可读取 |
-| 调仓频率 | `RuleSettings` 自定义 | 当前固定逐日预测和组合决策 |
-| 训练过程 | 无 | 训练集拟合、验证集早停、测试期预测 |
-| 适合场景 | 规则策略、轮动、择时、账户感知逻辑 | 单证券时序特征驱动的截面打分组合 |
+| 回测日期、证券池、初始现金 | 策略目录的 `experiment.yaml` | 运行配置 → `experiment.py` / `core/engine.py` |
+| 规则回看长度、调仓周期、目标仓位 | 策略目录的 `rule.py → RuleSettings` | 运行配置和用户规则 |
+| 模型训练/验证区间、训练参数、组合分配 | 策略目录的 `model.py → ModelSettings` | `LoadedModelComponents.create_workflow()` 与模型组合分配 |
+| 费用、回测滑点、成交量参与比例、结果目录 | 实际使用的系统 YAML | 运行配置 → 费用、成交和输出模块 |
+| 模拟盘策略资金、调度起点 | 模拟盘 YAML 的 `strategy` | `StrategySpec` 与虚拟策略账户、信号调度 |
+| 模拟盘每日运行时刻、撤单时限、报价设置 | 模拟盘 YAML 的 `signal`、`execution`、`eod` | `LiveConfig` 直接传给调度器与交易任务 |
+| 模拟盘订单金额、总仓位等风控限制 | 模拟盘 YAML 的 `risk` | `jobs.py` → `LiveRiskManager` |
+| 模拟盘固定模型后端、模型文件 | 模拟盘 YAML 的 `strategy.model` | `LoadedModelComponents.load_inference_bundle()` |
 
-Rule 和 Model 最终都只产生目标权重，之后共用同一套订单、ETF 规则、成交和账户链路。因此
-新增策略不需要复制交易引擎，也不能绕过交易规则直接修改账户。
+回测的系统文件由 `--system` 决定，省略时沿用入口原有默认路径；
+模拟盘通过 `account.system_path` 选择系统文件。
+模拟盘启动时，费用与单个策略共用一次读取并校验的系统设置，没有新增跨运行缓存；
+状态数据库的配置解析和连接方式仍沿用原实现。
 
-## 8. 前复权与原始行情边界
+容易混淆的参数要分别修改：
 
-框架使用两个严格分离的行情对象：
+- `experiment.yaml.initial_cash` 是回测初始资金；模拟盘使用 `strategy.initial_capital`。
+- 模型组合参数决定生成的目标仓位；模拟盘 `risk` 决定该目标能否通过交易风控，两者都生效。
+- 模型训练/验证区间来自 `ModelSettings`；测试区间沿用实验的回测起止日期。
+- 模拟盘 YAML 选择已有模型文件，不会因为修改部署路径而重新训练模型。
 
-| 数据 | 主要对象 | 使用位置 | 目的 |
-|---|---|---|---|
-| 等比前复权 OHLCV | `MarketBarView` | Rule、Model 特征和模型标签 | 生成连续、可比较的研究信号 |
-| 原始未复权 OHLCV | `MarketBar` | 成交、估值、涨跌停证据和账户记账 | 保持真实份额与现金口径 |
+配置模型仍负责拒绝未知字段、非法金额、日期冲突及不合法时间顺序。
+增加共用运行参数时，修改其所属配置模型及 `UserExperimentConfig.build_case()` 的映射；
+只有新增策略专属参数时才需要调整 `build_backtest_config()` 中的对应分支。
+模拟盘 YAML 使用 `config_version: "4.0"` 和单个 `strategy` 对象；旧版策略列表不再接受。
 
-关键约束：
+### 单策略资金与已有账本
 
-- 用户策略看不到原始执行价格对象；
-- 前复权价格不能用于正式成交、持仓市值或现金记账；
-- `current_weight()` 由框架按原始收盘市值计算；
-- 原始价格不能反向进入 Model 特征；
-- D 日前复权收盘信号不能在同一个 D 日原始收盘价成交，必须等待 D+1。
+模拟盘只配置 `strategy.initial_capital` 作为策略初始本金，不配置 `account.capital_pool`
+或 `enabled`。策略可用现金等于账本现金减去未成交买单及其手续费预留；下单不查询券商
+账户可用现金。成交、手续费和持仓仍写入策略账本，重启不会重新发放初始本金。
 
-## 9. 配置与扩展边界
+保留 `strategy_id` 用于历史订单和持仓归属。现有状态库只有同一策略账本时可继续使用；
+若该账户已有其他策略账本，启动会报错，不会自动删除、合并或重置资金。
+切换策略 ID 时须先结束旧策略及其未完成订单，再使用独立的 `state_database`。
+数据库表结构和旧状态枚举保留用于历史数据兼容；`live_account.capital_pool` 仅写入初始本金，
+不再参与资金分配或下单校验。没有执行数据库迁移。
 
-### 系统配置
+原 Rule+Model 联合配置已删除。运行规则策略使用 `beginner_example_paper.yaml`；
+运行模型策略使用 `xgboost_example_paper.yaml`，同一账户同时只启动一个进程。
 
-`qmt_example/configs/system.yaml` 维护所有实验共用的配置：
+## 策略数据从哪里来、在哪里改
 
-- MySQL 连接与数据表名；
-- 数据快照身份；
-- 汇金 CSV、指数代码和涨跌幅资源；
-- 费用、滑点、成交量上限、执行模式和输出目录。
+回测和模拟盘都通过 `application/daily_decision.py → evaluate_daily_decision()` 进入策略。
+只有到达策略调度日才准备上下文和历史行情：
 
-### 实验配置
+1. `data/portal.py` 按信号日筛选已经加载的数据；各历史查询共用 `_checked_cutoff()` 检查日期覆盖。
+2. `strategy/context.py → StrategyContext.from_portal()` 组装份额、汇金和指数数据，
+   构造器继续校验日期、证券范围与数值，生成只读上下文。
+3. `strategy/rule.py → RuleMarketData` 引用这个上下文，并提供 `bars()`、
+   `share_on()`、`latest_huijin_ratio()` 等查询；不重新保存一套账户和辅助数据。
 
-`private_strategy/<实验名>/experiment.yaml` 只保存：
+| 要改的数据 | 实际修改位置 |
+|---|---|
+| 数据源的读取与记录转换 | `data/mysql.py`；仅新增字段且现有加载内容不足时需要调整 |
+| 前复权行情、份额、汇金、指数的日期筛选 | `data/portal.py` 对应查询方法 |
+| 辅助字段的声明、组装和合法性检查 | `strategy/context.py` 的字段、`from_portal()` 和对应 `_freeze_...` |
+| 用户规则需要的便捷查询 | `strategy/rule.py` 的 `RuleMarketData`；已有字段直接用现有方法 |
+| 回测账户转换为策略现金与持仓 | `strategy/context.py → AccountView.from_account()` |
+| 模拟盘虚拟账户的估值与持仓转换 | `live/account_adapter.py → adapt_virtual_account()`；账户视图和权重共用 `_account_state()` |
 
-- 实验名称；
-- 回测起止日期；
-- 初始资金；
-- `rule` 或 `model`；
-- 显式证券及资产池。
+新增辅助字段时，不需要在回测主流程和模拟盘主流程各加一套传递逻辑。
+原有直接构造 `StrategyContext`、`RuleMarketData` 的方式继续保留。
 
-Rule 个性参数只写在 `rule.py/RuleSettings`；Model 个性参数只写在
-`model.py/MODEL_SETTINGS`。不要恢复 YAML 和 Python 两套策略参数来源。
+日期口径不能混用：ETF 行情按最近 N 个交易日筛选；指数按截至 D 的最近 N 条已有记录筛选。
+份额和指数可包含 D 日，汇金报告期必须严格早于 D；
+合并汇金比例采用最新同一报告期，不能直接把各主体不同报告期的最新值相加。
 
-## 10. 测试体系
+虚拟账户直接用自己的现金、持仓和原始收盘价计算净资产与权重，不再构造中间券商资产对象。
+策略账户仍只暴露现金和数量，前复权行情与原始估值价格保持分离。
 
-`tests/` 随公开仓库上传。覆盖率是参考指标，不是 90% 强制发布门槛；优先保证核心数据、
-时序、交易、账户和扩展合同正确。
+## 回测按什么顺序运行
 
-主要测试分层：
+从项目根目录阅读以下路径：
 
-- `tests/unit/config/`：配置、秘密和代码规范化；
-- `tests/unit/data/`：Repository 映射、数据门户、日历和证券池；
-- `tests/unit/strategy/`：Rule/Model 合同、加载、训练、组合和调度；
-- `tests/unit/core/`：订单、涨跌停、T+0/T+1、整手、费用、滑点、账户和引擎；
-- `tests/unit/output/`、`evaluation/`：结果原子写入、指标和图表；
-- `tests/unit/experiments/`：配置、CLI、脚手架和两个用户示例；
-- `tests/regression/`：核心回测行为的回归合同。
+1. `run_backtest.py → main()`：接收实验路径和系统配置路径。
+2. `etf_backtest/experiment.py → run_experiment()`：调用 `prepare_experiment()`，
+   读取用户策略和配置，再通过 `build_backtest_config()` 合并运行参数；加载与参数组装逻辑位于 `application/strategy_source.py`。
+3. `application/runtime_factory.py → build_backtest_runtime()`：确定证券范围，
+   读取行情和日历，准备 `DailyDataPortal` 与交易规则。
+4. 模型模式调用 `experiment.py → _build_model()`，构建样本，通过
+   `strategy/model.py → LoadedModelComponents.create_workflow()` 选择后端并训练一次；
+   规则模式直接使用用户规则。
+5. `experiment.py → _run_backtest()`：创建账户、费用和成交组件，调用
+   `core/engine.py → BacktestEngine.run()`，最后检查净值日期是否完整。
+   逐日引擎通过 `application/daily_decision.py → evaluate_daily_decision()` 产生新目标。
+6. `experiment.py → _write_results()`：统一准备指标、来源信息和图表，
+   通过 `output/writer.py` 写出结果；规则和模型共用一次结果写出；模型临时文件一直保留到结果写出结束。
 
-安装开发依赖：
+只看运行顺序时，从 `experiment.py` 顶部的 `run_experiment()` 开始；
+账户初始化与回测组件在同文件的 `_run_backtest()`，报告准备在 `_write_results()`。
+实际成交、持仓变化和逐日信号仍在 `core/engine.py`，不放入入口函数。
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[deep,dev]"
-```
+策略读取复权价，成交和估值使用原始价。最后一个行情日不再产生无法执行的新目标。
 
-运行开发检查：
+## 模拟盘按什么顺序运行
 
-```powershell
-.\.venv\Scripts\python.exe -m ruff check .
-.\.venv\Scripts\python.exe -m ruff format --check .
-.\.venv\Scripts\python.exe -m mypy etf_backtest qmt_example private_strategy run_backtest.py
-.\.venv\Scripts\python.exe -m pytest -q
-```
+1. `run_paper_trading.py → main()` 加载模拟盘配置。
+2. `live/service.py → build_production_runtime()` 组装用户策略、固定模型、数据入口、
+   券商、回调处理和调度器。已有模型通过
+   `strategy/model.py → LoadedModelComponents.load_inference_bundle()` 加载，不触发训练。
+3. `live/engine.py → run_forever()` 维持账户锁，循环调用
+   `live/scheduler.py → tick()`。其中直接列出调仓、日终、生成信号的时间表；
+   持久化记录用于去重。常驻循环只在交易引擎中，调度器不另起循环。
+   调仓与日终必须经过交易引擎的券商会话，不能由调度器直接调用交易任务。
+4. 信号任务进入 `live/jobs.py → prepare_signal()`，由
+   `live/signals.py → SignalService.evaluate()` 准备历史数据和账户视图，
+   调用共用的 `evaluate_daily_decision()`，然后保存决策及目标仓位。
+5. 调仓和日终任务先经过 `live/engine.py → _run_broker_job()`：
+   建立券商会话，执行 `startup_reconcile()`，然后进入具体任务，结束后断开会话。
 
-不需要 MySQL 的单元和回归测试应先通过。发布前再使用真实 SELECT-only 账号执行
-`validate`，并分别运行一个短区间 Rule 和 Model 冒烟回测；前后核对数据库未发生写入。
+具体交易顺序集中在 `live/jobs.py`：
 
-## 11. 文档职责与关系
+| 任务 | 按顺序阅读的函数 |
+|---|---|
+| 调仓 | `execute_pending_target()` → `_execute_pending_target()` → `_execute_phase()`：卖出 → 等待/对账 → 买入 → 等待/对账 |
+| 生成与提交订单 | `_execute_strategy_side()` → 执行规划、价格策略和风控 → `_submit_intent()` |
+| 成交等待与撤单确认 | `_wait_for_phase()` / `_cancel_open_orders()` → `_wait_for_order_closure()`：查询 → 对账 → 检查本地活动订单 |
+| 日终 | `eod()` → `_reconcile_eod()` → `_snapshot_eod()` → `_snapshot_strategy()` |
+| 券商事实入账 | `live/broker/callbacks.py` 和 `live/reconciliation.py` → `repository.record_strategy_trade_if_absent()` |
 
-| 文档 | 读者 | 作用 |
+`_run_job()` 管理任务锁、去重和结束状态；`_run_strategy_step()` 管理单个策略步骤。
+`repository.finish_job_run()` 无额外参数表示成功，`error=异常` 表示失败，
+`skip_reason=原因` 表示跳过。账户安全异常会中止整个批次，普通策略异常按原流程记录处理。
+`_execute_phase()` 共用卖出/买入的任务记录与等待处理，卖出完成后额外对账；买入前重新取时间与报价。
+
+## 一笔模拟盘订单怎样结束
+
+1. `jobs.py → _execute_strategy_side()` 生成目标订单、检查风控并保存意图；
+   只有允许提交且仍为 `PLANNED` 的意图进入 `_submit_intent()`。
+2. `_submit_intent()` 先标记 `SUBMITTING`，再调用券商。
+   接受后绑定券商订单号，明确拒绝则记录 `REJECTED`；
+   提交异常、结果不明或绑定失败，通过 `_mark_submission_unknown()` 记录不确定状态并暂停账户。
+3. `broker/callbacks.py → BrokerEventConsumer` 处理单条回报，核验本地订单身份后保存订单或成交。
+   回报处理与主动查询共用现有的成交去重入账方法，不各记一套账。
+4. `reconciliation.py → ReconciliationService.reconcile()` 用主动查询的订单与成交核对数量、身份和状态，
+   对已确认终态的意图标记 `COMPLETED` 或 `INCOMPLETE`。
+5. `jobs.py → _wait_for_order_closure()` 共用轮询流程：查询订单与成交 → 对账 → 检查本地活动订单。
+   没有活动订单时结束等待，并不表示每笔订单都已全部成交。
+   成交等待到期后调用撤单；撤单确认到期仍有活动订单时暂停账户并报错。
+
+订单数量、限价和备注标识的匹配集中在 `reconciliation.py → order_terms_match()`。
+证券和买卖方向仍在各自的身份检查入口核验：
+回报遇到非法方向会抛出异常，对账将方向不匹配归入对账报告；原有差异保留。
+订单、成交的归属查找及事务边界保持原样。
+
+| 订单停在哪一步 | 先读哪个函数 | 对照的现有状态或原因 |
 |---|---|---|
-| [`README.md`](README.md) | 普通用户 | 从安装、MySQL 配置到创建和运行一次 Rule/Model 回测 |
-| [`README_DEVELOPER.md`](README_DEVELOPER.md) | 核心开发者 | 项目能力、边界、架构、模块和测试说明 |
-| [`docs/RULE_API.md`](docs/RULE_API.md) | Rule 作者 | `RuleSettings`、`RuleMarketData` 和返回值的完整接口 |
-| [`docs/MODEL_API.md`](docs/MODEL_API.md) | Model 作者 | 特征、网络、训练、数据切分和组合接口 |
-| [`docs/spec/QMT日频回测系统_唯一规范.md`](docs/spec/QMT日频回测系统_唯一规范.md) | 核心维护者 | 修改核心行为时必须遵守的系统行为合同 |
-| [`resources/limit_rules/ETF_PRICE_LIMIT_RULES.md`](resources/limit_rules/ETF_PRICE_LIMIT_RULES.md) | 数据资源维护者 | 20% 涨跌幅例外数据的来源、冻结口径和更新要求 |
+| 生成后没有提交 | `jobs.py → _execute_strategy_side()` | 意图是否为 `PLANNED`，风控或时间窗的拒绝原因 |
+| 提交结果不明、接受后本地绑定失败 | `jobs.py → _submit_intent()`、`_mark_submission_unknown()` | `SUBMIT_UNKNOWN`、`SUBMIT_RESULT_UNKNOWN` |
+| 部分成交后一直等待 | `jobs.py → _wait_for_order_closure()`，再看 `reconciliation.py` | 活动订单、成交数量差异、`RECONCILIATION_UNRESOLVED` |
+| 撤单未接受或确认超时 | `jobs.py → _cancel_open_orders()` | `CANCEL_RESULT_UNKNOWN`、`CANCEL_CONFIRM_TIMEOUT` |
+| 回报身份异常或无法入账 | `broker/callbacks.py → _persist_order()` / `_persist_trade()` | `LOCAL_CALLBACK_*_IDENTITY_MISMATCH`、`BROKER_CALLBACK_PERSISTENCE_ERROR` |
+| 重启后不继续下单 | `jobs.py → _resume_persisted_intents()` 和启动对账 | `SUBMITTING` / `SUBMIT_UNKNOWN` 不会被直接重新提交；`PLANNED` 仍受提交窗口限制 |
 
-“唯一规范”不是入门教程，也不是 API 列表。它是实现、测试和验收的行为基准，解决的是
-“框架必须保持什么语义”；本开发说明解决的是“框架由什么组成、当前能做什么”；API 手册
-解决的是“用户写 Rule/Model 时可以调用什么”。
+上述表格用于定位代码和已有记录，不需要手工修改数据库状态。
 
-如果核心行为确实需要改变，应同步更新：
+## 出问题先看哪里
 
-1. `etf_backtest/` 实现；
-2. 对应自动测试；
-3. 普通用户受影响的 `README.md`；
-4. Rule 或 Model 接口手册；
-5. 本开发说明；
-6. “唯一规范”中的行为合同。
+回测和模拟盘入口都会把启动错误写到终端。模拟盘日志包含时间、级别、模块名；
+当前入口没有配置固定日志文件，先查看启动终端或目标电脑已有的输出重定向位置。
 
-## 12. 开发原则
+| 现象 | 先看什么 | 对应代码 |
+|---|---|---|
+| 配置/策略加载失败，尚未开始回测 | 终端异常类型和消息；此时可能没有输出目录 | `application/strategy_source.py`、`experiments/config.py`、`strategy/loader.py`、`strategy/model.py` |
+| 回测运行失败 | 若已生成，本次输出目录的 `run.json` 中 `error_type`、`error_message` | `experiment.py`；再按报错转到对应模块 |
+| 行情缺失、日期不齐、停牌或价格上下限错误 | 终端或 `run.json` 中指出的证券、日期和字段 | `data/mysql.py` → `data/portal.py`；规则边界看 `core/effective_rules.py` |
+| 模型无法加载 | 终端的模型兼容性异常，按字段核对用户模型与模型文件 | `strategy/model_contracts.py` 及对应训练后端模块 |
+| 回测没有交易或结果异常 | `orders.csv`、`trades.csv`、`daily_positions.csv`、`daily_nav.csv` | `application/daily_decision.py`、用户策略、`core/engine.py` |
+| 模拟盘到时间没有运行 | 终端调度日志；已有 `live_job_run` 的任务日期、status、error_type、error_message | `live/scheduler.py → tick()`、`live/jobs.py → _run_job()` |
+| 模拟盘有信号但没有订单 | 已有 `live_decision` 的决策状态、`live_target_position` 的目标；未到调仓日或不调仓也会保存决策 | `live/signals.py`、`live/jobs.py → _execute_pending_target()` |
+| 订单被拒绝或提交结果不明确 | 终端券商日志、已有 `live_order_intent` 的 status 和 reject_reason | `live/execution/`、`live/risk.py`、`live/broker/` |
+| 账户暂停或现金、持仓不一致 | 已有 `live_account.pause_reason`，结合券商订单、成交和虚拟策略账本记录 | `live/reconciliation.py`、`live/persistence/repository.py` |
 
-- MySQL 连接保持只读，结果只写本地新目录；
-- 具体策略逻辑只放在 `private_strategy/`，不写进核心包；
-- raw、front 和账户对象保持边界隔离；
-- `EtfRuleEngine` 继续作为订单批准数量的唯一决策者；
-- 只有正式 `FillResult` 可以修改 `Account`；
-- 新增公开 Rule/Model 接口时同步更新 API 文档、脚手架、示例和测试；
-- 保留结果可追溯性，不覆盖既有运行或隐藏失败状态。
+回测输出根目录由系统配置的 `runs_dir` 决定，默认是 `runs/`；每次运行有独立 run_id。
+模拟盘排查时先确定 account_id、strategy_id、任务日期，再沿 decision_id、intent_id 查记录。
+以上状态表只用于说明已有记录的位置，不需要新增、删除或手工修改数据库记录。
 
-本项目采用 [MIT License](LICENSE)，版权归 `Str_lab`。
+## 修改框架功能的定位表
+
+| 功能 | 文件 |
+|---|---|
+| 证券池、上市生命周期 | `etf_backtest/universe/resolver.py` |
+| 特征、训练样本、标签、评估 | `etf_backtest/strategy/model_data.py` |
+| 回测账户初始化、运行顺序、报告准备 | `etf_backtest/experiment.py` 的 `_run_backtest()`、`run_experiment()`、`_write_results()` |
+| 模型训练后端选择、固定模型加载 | `etf_backtest/strategy/model.py` 的 `LoadedModelComponents` |
+| 每天三项任务的调度顺序 | `etf_backtest/live/scheduler.py` 的 `tick()`；执行时间仍在模拟盘 YAML |
+| 券商连接、账户锁、常驻循环 | `etf_backtest/live/engine.py` |
+| 模型说明信息、保存格式与公共检查 | `etf_backtest/strategy/model_contracts.py` |
+| Torch / XGBoost 训练与模型文件 | `etf_backtest/strategy/model_training.py` / `xgboost_training.py` |
+| 预测、组合分配、策略可见数据 | `etf_backtest/strategy/model_runtime.py`、`portfolio.py`、`context.py`、`rule.py` |
+| 目标股数、交易限制、费用、滑点 | `etf_backtest/core/sizing.py`、`etf_rules.py`、`fee.py`、`fill.py` |
+| 回测成交与账户记账 | `etf_backtest/core/fill.py`、`account.py`、`position.py` |
+| 模拟盘虚拟账本、任务和订单状态 | `etf_backtest/live/persistence/repository.py` |
+| 回测指标、图表、文件输出 | `etf_backtest/evaluation/`、`etf_backtest/output/writer.py` |
+
+## 修改时要保留的约定
+
+- D 日生成目标，最早下一合法交易日执行；模拟盘遵循自己的配置时间窗。
+- Rule 返回空映射或 NO_REBALANCE 表示保持持仓，显式零表示清仓，省略证券表示保持数量。
+- 模型回测训练一次，模拟盘使用固定模型；已有 Torch/XGBoost 文件格式保持兼容。
+- 单策略独立记账、先卖后买、成交去重、撤单确认、锁和恢复是业务规则。
+- 环境、数据库、账号密码及现有表结构不因代码整理而修改。
+- 文件哈希集中在 `file_utils.py`；模型身份、资源身份、订单标识和任务锁仍沿用原有含义。
+
+历史代码保存在项目相邻的 `main_backtest_baselines/` 压缩备份中，不依赖 Git。
+其中的旧代码副本和核对材料不参与运行。测试目录未随内部接口精简同步，
+部分旧测试仍引用已删除接口；不能据此判断目标环境当前是否可运行。
+已完成的是本地静态核对与离线比对，精简后的代码没有重新进行目标环境端到端验收。
+
+
+## 本轮完整精简流程与停止标准（2026-09-09）
+
+本轮基线：核心包 79 个 Python 文件、18,655 行（含注释和空行）。
+按以下顺序连续完成，不以必须删除多少行为目标：
+
+1. 保存本轮源码基线，核对两个入口、用户策略接口和配置边界。
+2. 检查内部无调用代码、纯转发包装及重复转换；保留框架自动调用的校验和公开策略接口。
+3. 检查模型特征、训练、预测、保存和加载；合并确实相同的处理，保留两种后端差异。
+4. 整理回测报告组装和输出字段，保持文件名、列顺序、数值格式及失败处理。
+5. 复核配置到信号、信号到任务的调用链；保留交易保护，不修改数据库及账本逻辑。
+6. 更新本说明，完成引用、语法和针对改动的离线对照，记录实际变化及验证限制。
+
+预期效果：两个运行入口，明确的策略修改位置，集中维护的公共逻辑，
+可沿调用顺序定位问题。没有新命令、新依赖或新增生产代码文件。
+数据库、环境、账号密码、现有 YAML 和默认值不因本轮整理而改变。
+
+停止标准：本轮检查范围内能够确认的冗余已处理；剩余代码用于实际功能、
+用户接口兼容或必要保护。到此结束整体精简，后续围绕具体需求修改，
+不再为了行数继续抽象、合并模块或删除保护。
+
+
+### 执行结果：六步已完成
+
+- 基线已保存到原有压缩备份的 `before_final_cleanup/`，没有增加生产代码文件。
+- 内部引用检查未发现可直接删除的私有死代码；Pydantic 自动调用的校验全部保留。
+- Torch 的两个加载入口共用 `model_training.py → _load_payload()`；
+  训练、推理各自的格式与兼容性要求仍在各入口核验。XGBoost 保留原有实现。
+- `experiment.py → _write_results()` 统一规则和模型的成功输出，
+  用标准库 `ExitStack` 管理模型临时目录；数据身份只构造一次。
+- `output/writer.py` 的 `_DAILY_FIELDS`、`_ORDER_FIELDS`、
+  `_APPROVAL_FIELDS`、`_TRADE_FIELDS` 同时用于字段取值和 CSV 表头，
+  减少字段漏改。需要计算的持仓列、指标公式和最终账户组装继续显式保留。
+- 两个命令、共用信号入口和模拟盘调度链已复核；本轮未修改模拟盘与数据库模块。
+
+核心代码由 18,655 行变为 18,625 行，净减少 30 行；仍为 79 个 Python 文件。
+实际修改 3 个生产代码文件及本说明。行数包含空行和注释，不含本说明与离线核对脚本。
+
+针对本轮改动的 61 组离线对照通过：13 组输出文件/失败处理对照，
+22 组报告组装/异常/临时目录清理对照，26 组 Torch 加载入口对照。
+输出对照使用实际输出代码及合成数据；Torch 加载对照替代了底层文件读取，
+没有运行实际模型训练。全部核心文件语法通过，
+其余生产源码、入口、用户策略及已备份配置与本轮基线一致。
+未连接数据库、未连接券商、未重新运行目标电脑端到端验收。
+
+可执行核对脚本与基线放在同一 ZIP 的 `before_final_cleanup/check_final.py`；
+如需重跑，将它解压到临时位置，从项目根目录用现有 Python 执行即可。
+历史测试目录按本轮要求未整理，仍存在前文说明的旧接口引用。
+
+本轮结论：已达到本说明的停止标准。剩余代码主要承担行情与交易规则、
+两种模型后端、账户/订单生命周期和必要校验。本轮未发现更多能够明确保持行为、
+同时让代码更易读的删减；这不代表数学意义上的最少代码。结束整体精简，后续按具体需求维护。

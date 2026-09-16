@@ -1,9 +1,8 @@
-"""Pure dynamic metrics derived from bt_daily and bt_trade projections.
+"""根据 bt_daily 和 bt_trade 投影计算的纯动态指标。
 
-The evaluator consumes immutable values corresponding to persisted result
-columns.  It does not query or write a database, inspect strategies, or use
-intraday bars.  Every return calculation is based on the daily total-asset
-sequence and explicitly anchors its first observation to ``initial_cash``.
+评价器只接收与持久化结果列对应的不可变值，不查询或写入数据库、不检查策略，也不使用
+日内行情。所有收益计算均以每日总资产序列为基础，并将首个观察值明确锚定到
+``initial_cash``。
 """
 
 from __future__ import annotations
@@ -22,9 +21,10 @@ _HALF: Final = Decimal("0.5")
 
 
 class BacktestMetricsError(ValueError):
-    """Raised when persisted result projections cannot produce valid metrics."""
+    """持久化结果投影无法生成有效指标时抛出。"""
 
 
+# 校验绩效计算所用金额为有限非负 Decimal。
 def _non_negative_decimal(value: object, field_name: str) -> Decimal:
     if not isinstance(value, Decimal):
         raise TypeError(f"{field_name} must be Decimal")
@@ -37,13 +37,14 @@ def _non_negative_decimal(value: object, field_name: str) -> Decimal:
 
 @dataclass(frozen=True, slots=True)
 class DailyMetricRow:
-    """Read-only projection of one bt_daily row used by metrics."""
+    """指标计算使用的单行 bt_daily 只读投影。"""
 
     trade_date: date
     cash: Decimal
     market_value: Decimal
     total_asset: Decimal
 
+    # 检查每日绩效输入中的日期、现金、持仓市值与总资产。
     def __post_init__(self) -> None:
         if isinstance(self.trade_date, datetime) or not isinstance(self.trade_date, date):
             raise TypeError("trade_date must be datetime.date")
@@ -56,7 +57,7 @@ class DailyMetricRow:
 
 @dataclass(frozen=True, slots=True)
 class TradeMetricRow:
-    """Read-only projection of one formal fill used by cost metrics."""
+    """成本指标使用的单笔正式成交只读投影。"""
 
     trade_amount: Decimal
     fee: Decimal
@@ -64,6 +65,7 @@ class TradeMetricRow:
     fill_price: Decimal
     fill_quantity: int
 
+    # 检查成交绩效输入中的数量、金额、费用及滑点字段。
     def __post_init__(self) -> None:
         amount = _non_negative_decimal(self.trade_amount, "trade_amount")
         _non_negative_decimal(self.fee, "fee")
@@ -80,14 +82,14 @@ class TradeMetricRow:
 
     @property
     def slippage_cost(self) -> Decimal:
-        """Return adverse price movement relative to the raw close quote."""
+        """返回相对原始收盘报价的不利价格变动成本。"""
 
         return abs(self.fill_price - self.base_trade_price) * self.fill_quantity
 
 
 @dataclass(frozen=True, slots=True)
 class BacktestMetricResult:
-    """Complete dynamically calculated backtest metric set."""
+    """动态计算得到的完整回测指标集。"""
 
     daily_returns: MappingProxyType[date, Decimal]
     cumulative_return: Decimal
@@ -102,6 +104,7 @@ class BacktestMetricResult:
     trade_count: int
     turnover: Decimal
 
+    # 要求日收益映射已经不可变，并检查成交笔数为非负整数。
     def __post_init__(self) -> None:
         if not isinstance(self.daily_returns, MappingProxyType):
             raise TypeError("daily_returns must be an immutable mapping")
@@ -110,7 +113,7 @@ class BacktestMetricResult:
 
 
 class BacktestMetrics:
-    """Calculate fixed-formula metrics without persistence side effects."""
+    """按固定公式计算指标，不产生持久化副作用。"""
 
     @staticmethod
     def calculate(
@@ -119,7 +122,7 @@ class BacktestMetrics:
         daily_rows: Sequence[DailyMetricRow],
         trade_rows: Sequence[TradeMetricRow],
     ) -> BacktestMetricResult:
-        """Return daily-return, risk, fee, count, and turnover metrics."""
+        """返回日收益、风险、费用、交易次数和换手率指标。"""
 
         initial = _non_negative_decimal(initial_cash, "initial_cash")
         if initial <= _ZERO:
@@ -194,6 +197,7 @@ class BacktestMetrics:
             turnover=turnover,
         )
 
+    # 按交易日数量与年化系数把区间收益转换为年化收益。
     @staticmethod
     def _annualized_return(
         *,
@@ -207,6 +211,7 @@ class BacktestMetrics:
         exponent = _TRADING_DAYS_PER_YEAR / day_count
         return (ratio.ln() * exponent).exp() - _ONE
 
+    # 从包含初始资产锚点的净值路径计算峰值到后续低点的最大回撤。
     @staticmethod
     def _max_drawdown(
         *,
@@ -221,6 +226,7 @@ class BacktestMetrics:
             maximum = max(maximum, drawdown)
         return maximum
 
+    # 用日收益均值和样本标准差计算年化夏普比率，处理样本不足及零波动。
     @staticmethod
     def _sharpe(daily_returns: tuple[Decimal, ...]) -> tuple[Decimal, str | None]:
         if len(daily_returns) < 2:

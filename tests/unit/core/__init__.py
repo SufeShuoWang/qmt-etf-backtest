@@ -1,1 +1,1 @@
-"""Core backtest unit-test package."""
+"""核心回测单元测试包。"""

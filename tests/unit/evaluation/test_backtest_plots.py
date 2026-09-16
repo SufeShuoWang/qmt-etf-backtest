@@ -1,4 +1,4 @@
-"""Basic coverage for final full-period backtest charts."""
+"""最终全周期回测图表的基础覆盖测试。"""
 
 from datetime import date
 from decimal import Decimal

@@ -1,4 +1,4 @@
-"""Data access package for the frozen QMT daily snapshot."""
+"""冻结 QMT 日频快照的数据访问包。"""
 
 from etf_backtest.data.calendar import (
     CalendarCoverageError,

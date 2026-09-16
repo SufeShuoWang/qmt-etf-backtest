@@ -23,8 +23,8 @@
 - 股票 ETF 为 T+1，`518` 黄金 ETF 为 T+0；
 - 真实交易约束、费用、滑点、成交量上限、账户和绩效统计；
 - 本地文件结果输出，不向 MySQL 写回任何回测结果；
-- 唯一运行入口由 `python -m qmt_example new|validate|run` 三个子命令组成；实际回测统一使用
-  `run <experiment.yaml>`，并根据实验中的单个 `case` 运行 Rule 或 Model。
+- 运行入口仅保留 `python run_backtest.py <实验>` 与
+  `python run_paper_trading.py --config <配置>`；两者均执行完整业务流程。
 
 以下能力明确不属于现行版本：
 
@@ -212,8 +212,10 @@ Rule 路径直接注入满足策略协议的具体规则策略。运行不得创
   长度限制；指数只用于信号，不参与持仓和成交。
 - `current_weight(symbol)` 返回信号日 D 收盘记账后的实际持仓权重 `Decimal`，统一按该证券
   原始收盘市值除以账户总资产计算；接口对任意多资产 Rule 通用，不包含策略专属字段。
-- Rule 可返回 `NO_REBALANCE`，表示该信号日不创建 D+1 pending target、不生成订单并保持
-  当前实际份额；它与空权重映射“目标全部持币”含义不同。
+- Rule 输出映射只包含本次需要调整的证券；省略证券保持实际份额不变，显式零权重表示清仓
+  对应证券，每个非零权重仍是相对 D+1 总资产的绝对目标权重。
+- Rule 可返回 `NO_REBALANCE` 或空权重映射，表示该信号日不创建 D+1 pending target、
+  不生成订单并保持当前实际份额。全部清仓必须为相关持仓显式返回零权重。
 
 这些接口只属于 `RuleMarketData`；Model、FeatureBuilder、MarketBarView 和 MarketFrame 均不得
 新增或读取这些字段。
@@ -225,8 +227,9 @@ Model 路径必须有一个可实际运行的非 `example_model` 模型和 Featu
 回测的预测时点。一个运行中不得隐式重新拟合。模型 bundle 必须记录模型类、参数、特征
 定义、训练切分、随机种子和数据集版本。
 
-私有 Model 扩展固定经过 `FeatureBuilder → DatasetSplits → DailyTorchWorkflow →
-PredictorBundle → DailyModelStrategy` 链路。标准化器只能用训练集拟合；Workflow 在一次运行中
+私有 Model 扩展固定经过 `FeatureBuilder → DatasetSplits → ModelWorkflow →
+PredictorBundle → DailyModelStrategy` 链路。Torch 标准化器只能用训练集拟合；
+XGBoost 不使用标准化器。Workflow 在一次运行中
 只能训练或加载一次。用户插件是受路径和类名校验的可信本地 Python 代码，不是安全沙箱。
 `DailyModelStrategy` 支持从超过阈值的 Top-K 预测生成多资产动态目标权重；组合参数和可选
 自定义权重函数只写在 `model.py`，所有输出都必须经过证券、有限权重和总仓位上限校验。
@@ -246,21 +249,18 @@ TargetPortfolio → Order → TradePriceQuote → Estimate
 
 ## 7. 配置和唯一入口
 
-新用户命令为：
+运行入口为：
 
 ```powershell
-python -m qmt_example new experiment my_strategy
-python -m qmt_example validate private_strategy/my_strategy/experiment.yaml
-python -m qmt_example run private_strategy/my_strategy/experiment.yaml
+python run_backtest.py private_strategy/my_strategy/experiment.yaml
+python run_paper_trading.py --config qmt_example/configs/live/xgboost_example_paper.yaml
 ```
 
-`new experiment` 必须同时生成不覆盖的 `experiment.yaml`、`rule.py` 和 `model.py`。
-`validate` 只是本地预检，不能冒充成功回测；`run` 必须真正创建只读 MySQL 连接、
-Repository、策略、Engine 和本地 Writer。一个实验只允许 `case: rule` 或 `case: model`，
-需要比较时分别运行两个实验。
-
-CLI 不保留固定策略或内置回归入口；示例与用户策略使用同一实验入口。任何一条 `run` 路径
-都不允许只打印 `ready` 或仅验证 YAML。
+回测入口必须真正创建只读 MySQL 连接、Repository、策略、Engine 和本地 Writer。
+一个实验只运行 `case: rule` 或 `case: model`。模拟盘入口直接启动自动调度，按原配置
+执行每日信号、交易、撤单和日终对账快照。新策略通过复制现有示例目录创建。
+运行时必要的数据、模型和交易检查继续保留；无独立预检、手工任务或数据库管理命令。
+数据库结构、历史记录、用户密码及连接配置不修改。
 
 私有实验 YAML 只保存名称、日期、初始现金、证券池和单个 `case`；Rule 个性参数必须由
 `rule.py/RuleSettings` 唯一拥有，Model 个性参数必须由 `model.py/MODEL_SETTINGS` 唯一拥有。
@@ -277,7 +277,8 @@ CLI 不保留固定策略或内置回归入口；示例与用户策略使用同�
 - `daily_nav.csv`、`daily_positions.csv`、`orders.csv` 和 `trades.csv`；
 - `metrics.json` 和 `final_account.json`；
 - 回测全部交易日完成后一次性生成的累计收益率、回撤和现金三张完整区间图；
-- Model 运行额外保存 `model_bundle.pt` 和 `predictions.csv`。
+- Model 运行额外保存 bundle 和 `predictions.csv`；Torch bundle 为
+  `model_bundle.pt`，XGBoost bundle 为 `model_bundle.ubj`。
 
 写入必须使用临时目录加原子提交；失败运行不得留下伪装成成功的完整目录。运行 ID 唯一，
 不得覆盖既有运行。金额与价格保持 Decimal 语义，序列化格式和小数位规则必须稳定。
@@ -314,15 +315,14 @@ CLI 不保留固定策略或内置回归入口；示例与用户策略使用同�
 输入表行数与摘要不变。真实数据测试未收集、跳过、缺凭据或数据库未导入时，状态只能是
 BLOCKED/INCOMPLETE，不能记 PASS。
 
-`validate` 使用个人账号执行轻量 SELECT 预检；发布前另外运行一个 Rule 和一个 Model
-真实回测。真实入口按 `SSE_FOR_ALL` 只要求 SSE 日历，并必须校验配置证券具有 raw/front
+真实回测使用现有回测入口。真实入口按 `SSE_FOR_ALL` 只要求 SSE 日历，并必须校验配置证券具有 raw/front
 数据。
 
 结果必须明确标记 RETROSPECTIVE_SNAPSHOT，验证存在日终序列、现金不为负、正式成交完整、SELL
 先于 BUY，并证明 Model 没有在回测期内偷偷重训。
 
-## 11. 迁移和历史保留
+## 11. 历史保留
 
-删除旧例子前必须先让新 CLI 的 Rule/Model 和内存端到端测试通过；发布前再执行真实只读
-smoke。删除后运行同一套测试和零引用扫描。`main_backtest.7z` 必须原样保留。项目没有 Git，任何计划、
-脚本或报告都不得把 Git 状态、分支或提交当作恢复与验收机制。
+命令精简前的代码、配置、模型和本地结果保存在项目相邻的 main_backtest_baselines 目录。
+不处理 Git，不迁移、不初始化、不修改数据库。目标环境端到端验收已由用户确认完成。
+测试目录本次不调整；旧命令相关测试属于此前接口，不作为当前运行方式说明。

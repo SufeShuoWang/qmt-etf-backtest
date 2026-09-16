@@ -1,4 +1,4 @@
-"""Pure daily SSE calendar and non-leaking DataPortal tests."""
+"""纯日频上交所日历和无未来泄漏 DataPortal 测试。"""
 
 from __future__ import annotations
 

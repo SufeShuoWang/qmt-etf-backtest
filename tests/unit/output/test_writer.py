@@ -12,7 +12,7 @@ from etf_backtest.evaluation.backtest_metrics import (
     DailyMetricRow,
     TradeMetricRow,
 )
-from etf_backtest.output.writer import BacktestOutputWriter
+from etf_backtest.output.writer import BacktestOutputWriter, ModelArtifacts
 from tests.unit.core.conftest import DATES
 
 _PNG = b"\x89PNG\r\n\x1a\nfixture"
@@ -134,3 +134,39 @@ def test_writer_never_overwrites_and_failure_publishes_only_run_json(
             plots={"cash.png": _PNG},
         )
     assert not (tmp_path / "bad-plots").exists()
+
+
+@pytest.mark.unit
+def test_writer_uses_safe_backend_specific_model_bundle_name(
+    tmp_path: Path,
+    engine_components,
+) -> None:
+    engine, *_ = engine_components
+    result = engine.run(start_date=DATES[0], end_date=DATES[-1])
+    bundle = tmp_path / "source.ubj"
+    bundle.write_bytes(b"xgboost bundle fixture")
+    run_dir = BacktestOutputWriter(tmp_path).write_success(
+        run_id="xgboost-run",
+        run_metadata={"case": "model", "backend": "xgboost"},
+        result=result,
+        metrics=_metrics(result),
+        plots={
+            "cumulative_return.png": _PNG,
+            "drawdown.png": _PNG,
+            "cash.png": _PNG,
+        },
+        model_artifacts=ModelArtifacts(
+            bundle_path=bundle,
+            bundle_filename="model_bundle.ubj",
+            predictions=(),
+        ),
+    )
+    assert (run_dir / "model_bundle.ubj").read_bytes() == bundle.read_bytes()
+    assert (run_dir / "predictions.csv").is_file()
+
+    with pytest.raises(ValueError, match="unsafe"):
+        ModelArtifacts(
+            bundle_path=bundle,
+            bundle_filename="../model_bundle.ubj",
+            predictions=(),
+        )

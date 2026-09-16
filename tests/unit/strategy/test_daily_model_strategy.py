@@ -1,4 +1,4 @@
-"""Framework-neutral daily model allocation tests."""
+"""与具体框架无关的日频模型分配测试。"""
 
 from __future__ import annotations
 
@@ -133,12 +133,15 @@ def test_daily_model_strategy_selects_highest_positive_score() -> None:
         context=context,
     )
 
-    assert dict(target.weights) == {symbols[1]: Decimal("0.90")}
+    assert dict(target.weights) == {
+        symbols[0]: Decimal("0"),
+        symbols[1]: Decimal("0.90"),
+    }
     assert {prediction.key.symbol for prediction in strategy.predictions} == set(symbols)
 
 
 @pytest.mark.unit
-def test_daily_model_strategy_holds_cash_without_positive_score() -> None:
+def test_daily_model_strategy_rejects_an_empty_top_k_selection() -> None:
     symbols, account_view, context = _inputs()
     strategy = DailyModelStrategy(
         feature_builder=_CloseFeatureBuilder(),
@@ -146,14 +149,13 @@ def test_daily_model_strategy_holds_cash_without_positive_score() -> None:
         portfolio=TopKPortfolio(),
     )
 
-    target = strategy.generate_target(
-        signal_date=context.signal_date,
-        market_history=(_view(symbols[0], "4"), _view(symbols[1], "6")),
-        account_view=account_view,
-        context=context,
-    )
-
-    assert dict(target.weights) == {}
+    with pytest.raises(ValueError, match="select at least one"):
+        strategy.generate_target(
+            signal_date=context.signal_date,
+            market_history=(_view(symbols[0], "4"), _view(symbols[1], "6")),
+            account_view=account_view,
+            context=context,
+        )
 
 
 @pytest.mark.unit
@@ -186,6 +188,7 @@ def test_daily_model_strategy_generates_and_records_dynamic_multi_asset_target()
     assert dict(target.weights) == {
         symbols[0]: Decimal("0.30"),
         symbols[1]: Decimal("0.60"),
+        symbols[2]: Decimal("0"),
     }
     assert [
         (row.symbol, row.rank, row.selected, row.target_weight) for row in strategy.allocations

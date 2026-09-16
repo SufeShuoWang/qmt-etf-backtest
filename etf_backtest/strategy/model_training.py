@@ -1,7 +1,7 @@
-"""Pluggable, deterministic PyTorch workflow for daily ETF predictions.
+"""用于日频 ETF 预测的可插拔、确定性 PyTorch 工作流。
 
-Importing this module never imports PyTorch.  The framework is required only
-when fitting, predicting, saving, or loading a torch state-dict bundle.
+导入本模块时不会导入 PyTorch；只有在拟合、预测、保存或加载 torch state-dict bundle
+时才需要该框架。
 """
 
 from __future__ import annotations
@@ -10,58 +10,61 @@ import importlib
 import math
 import os
 import random
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, cast
 from uuid import uuid4
 
 import numpy as np
+
+from etf_backtest.file_utils import sha256_file as bundle_sha256
 from sklearn.preprocessing import StandardScaler  # type: ignore[import-untyped]
 
-from etf_backtest.core.market import MarketBarView
 from etf_backtest.strategy.model_contracts import (
     DAILY_FORWARD_RETURN_LABEL,
-    MODEL_BUNDLE_SCHEMA_VERSION,
     DatasetSplits,
-    DateRange,
     FeatureBuilder,
     FeatureRecord,
-    LabeledRecord,
     ModelDataIdentity,
     ModelMetadata,
     PredictionRecord,
     RegressionMetricReport,
     TorchModelFactory,
-    build_feature_record,
     canonical_json,
     feature_fingerprint,
-    feature_records_for_signal,
     validate_feature_builder,
+    validate_dataset_schema,
+    build_model_metadata,
+    build_inference_payload,
+    validate_model_metadata,
+    validate_inference_payload,
 )
+from etf_backtest.strategy.model_data import (
+    DailyModelDatasetBuilder,
+    _feature_matrix,
+    _target_vector,
+    evaluate_predictions,
+)
+from etf_backtest.strategy.portfolio import ModelPortfolioPolicy, TopKPortfolio
+from etf_backtest.strategy.model_device import normalize_model_device
 
-TORCH_BUNDLE_FORMAT: Final = "ETF_DAILY_TORCH_STATE_DICT_V1"
-FOUR_FACTOR_FEATURE_NAMES: Final = (
-    "ret5",
-    "ret20",
-    "return_volatility20",
-    "volume_mean5_to_mean20",
-)
+TORCH_BUNDLE_FORMAT: Final = "ETF_DAILY_TORCH_STATE_DICT_V2"
+INFERENCE_BUNDLE_FORMAT_VERSION: Final = 1
 
 
 class TorchUnavailableError(ImportError):
-    """The optional PyTorch runtime is not installed."""
+    """未安装可选的 PyTorch 运行时。"""
 
 
 class TorchBundleCompatibilityError(ValueError):
-    """A saved bundle does not match the requested workflow identity."""
+    """已保存 bundle 与请求的工作流身份不匹配。"""
 
 
 def require_torch() -> Any:
-    """Lazily import PyTorch or raise an actionable optional-dependency error."""
+    """延迟导入 PyTorch；缺少依赖时抛出可操作的提示。"""
 
     try:
         return importlib.import_module("torch")
@@ -75,172 +78,9 @@ def require_torch() -> Any:
         raise
 
 
-class DailyFourFactorFeatureBuilder:
-    """The fixed daily four-factor schema packaged as a pluggable builder."""
-
-    __slots__ = ()
-
-    @property
-    def feature_names(self) -> tuple[str, ...]:
-        return FOUR_FACTOR_FEATURE_NAMES
-
-    @property
-    def required_history_trading_days(self) -> int:
-        return 21
-
-    def build_features(
-        self,
-        *,
-        symbol: str,
-        signal_date: date,
-        history: Sequence[MarketBarView],
-    ) -> Sequence[Decimal] | None:
-        del symbol, signal_date
-        rows = tuple(history)
-        if len(rows) < self.required_history_trading_days:
-            return None
-        closes = tuple(view.close for view in rows[-21:])
-        ret5 = closes[-1] / closes[-6] - Decimal("1")
-        ret20 = closes[-1] / closes[-21] - Decimal("1")
-        daily_returns = tuple(
-            closes[index] / closes[index - 1] - Decimal("1") for index in range(1, 21)
-        )
-        mean_return = sum(daily_returns, start=Decimal("0")) / Decimal("20")
-        variance = sum(
-            ((value - mean_return) ** 2 for value in daily_returns),
-            start=Decimal("0"),
-        ) / Decimal("20")
-        volumes = tuple(Decimal(view.volume) for view in rows[-20:])
-        mean_volume20 = sum(volumes, start=Decimal("0")) / Decimal("20")
-        if mean_volume20 == 0:
-            return None
-        mean_volume5 = sum(volumes[-5:], start=Decimal("0")) / Decimal("5")
-        return ret5, ret20, variance.sqrt(), mean_volume5 / mean_volume20
-
-
-class DailyTorchDatasetBuilder:
-    """Construct D-aligned samples while owning the fixed forward label."""
-
-    __slots__ = ("_feature_builder", "_feature_names", "_lookback")
-
-    def __init__(self, feature_builder: FeatureBuilder) -> None:
-        names, lookback = validate_feature_builder(feature_builder)
-        self._feature_builder = feature_builder
-        self._feature_names = names
-        self._lookback = lookback
-
-    @property
-    def feature_builder(self) -> FeatureBuilder:
-        return self._feature_builder
-
-    @property
-    def feature_names(self) -> tuple[str, ...]:
-        return self._feature_names
-
-    def build(
-        self,
-        *,
-        market_views: Iterable[MarketBarView],
-        train_range: DateRange,
-        valid_range: DateRange,
-        test_range: DateRange,
-    ) -> DatasetSplits:
-        for value, field_name in (
-            (train_range, "train_range"),
-            (valid_range, "valid_range"),
-            (test_range, "test_range"),
-        ):
-            if not isinstance(value, DateRange):
-                raise TypeError(f"{field_name} must be DateRange")
-        if not train_range.end_date < valid_range.start_date:
-            raise ValueError("train_range must precede valid_range")
-        if not valid_range.end_date < test_range.start_date:
-            raise ValueError("valid_range must precede test_range")
-
-        by_symbol: dict[str, dict[date, MarketBarView]] = {}
-        for view in market_views:
-            if not isinstance(view, MarketBarView):
-                raise TypeError("market_views may contain only MarketBarView values")
-            rows = by_symbol.setdefault(view.symbol, {})
-            if view.trade_date in rows:
-                raise ValueError(f"duplicate daily view for {view.symbol} on {view.trade_date}")
-            rows[view.trade_date] = view
-        if not by_symbol:
-            raise ValueError("market_views must not be empty")
-
-        split_rows: dict[str, list[LabeledRecord]] = {"train": [], "valid": [], "test": []}
-        for symbol in sorted(by_symbol):
-            ordered = tuple(by_symbol[symbol][day] for day in sorted(by_symbol[symbol]))
-            for index in range(len(ordered) - 2):
-                signal_date = ordered[index].trade_date
-                split_name = _split_name(
-                    signal_date,
-                    train_range=train_range,
-                    valid_range=valid_range,
-                    test_range=test_range,
-                )
-                if split_name is None:
-                    continue
-                history = ordered[max(0, index - self._lookback + 1) : index + 1]
-                feature_record = build_feature_record(
-                    builder=self._feature_builder,
-                    symbol=symbol,
-                    signal_date=signal_date,
-                    history=history,
-                )
-                if feature_record is None:
-                    continue
-                label = ordered[index + 2].close / ordered[index + 1].close - Decimal("1")
-                split_rows[split_name].append(
-                    LabeledRecord(
-                        key=feature_record.key,
-                        features=feature_record.features,
-                        label=label,
-                    )
-                )
-        return DatasetSplits(
-            feature_names=self._feature_names,
-            label_name=DAILY_FORWARD_RETURN_LABEL,
-            train_range=train_range,
-            valid_range=valid_range,
-            test_range=test_range,
-            train=tuple(split_rows["train"]),
-            valid=tuple(split_rows["valid"]),
-            test=tuple(split_rows["test"]),
-        )
-
-    def features_for_signal(
-        self,
-        *,
-        market_views: Sequence[MarketBarView],
-        signal_date: date,
-    ) -> tuple[FeatureRecord, ...]:
-        return feature_records_for_signal(
-            builder=self._feature_builder,
-            market_views=market_views,
-            signal_date=signal_date,
-        )
-
-
-def _split_name(
-    signal_date: date,
-    *,
-    train_range: DateRange,
-    valid_range: DateRange,
-    test_range: DateRange,
-) -> str | None:
-    if train_range.contains(signal_date):
-        return "train"
-    if valid_range.contains(signal_date):
-        return "valid"
-    if test_range.contains(signal_date):
-        return "test"
-    return None
-
-
 @dataclass(frozen=True, slots=True)
 class TorchTrainingConfig:
-    """Deterministic sequential mini-batch and validation early-stopping policy."""
+    """确定性的顺序 mini-batch 与验证集 early stopping 策略。"""
 
     seed: int = 20260803
     max_epochs: int = 500
@@ -249,8 +89,11 @@ class TorchTrainingConfig:
     learning_rate: float = 0.001
     weight_decay: float = 0.0
     min_delta: float = 0.0
+    device: str = "cpu"
 
+    # 检查 Torch 批大小、学习率、训练轮数、早停耐心值和随机种子等设置。
     def __post_init__(self) -> None:
+        object.__setattr__(self, "device", normalize_model_device(self.device))
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("seed must be a non-negative integer")
         if type(self.max_epochs) is not int or self.max_epochs <= 0:
@@ -270,6 +113,7 @@ class TorchTrainingConfig:
         if self.weight_decay < 0 or self.min_delta < 0:
             raise ValueError("weight_decay and min_delta must be non-negative")
 
+    # 把 Torch 训练设置转换为稳定参数映射，保存到模型元数据。
     def to_parameters(self) -> dict[str, object]:
         return {
             "seed": self.seed,
@@ -281,11 +125,12 @@ class TorchTrainingConfig:
             "min_delta": float(self.min_delta),
             "optimizer": "Adam",
             "loss": "MSELoss",
-            "device": "cpu",
+            "device": self.device,
             "batch_mode": "DETERMINISTIC_SEQUENTIAL_MINI_BATCH",
         }
 
 
+# 汇总 Torch 模型包、验证／测试预测与指标，以及最佳轮次和验证损失。
 @dataclass(frozen=True, slots=True)
 class DailyTorchWorkflowResult:
     bundle: DailyTorchBundle
@@ -297,6 +142,7 @@ class DailyTorchWorkflowResult:
     epochs_trained: int
     best_validation_loss: float
 
+    # 检查训练结果包、指标类型与最佳轮次、实际轮数和损失的关系。
     def __post_init__(self) -> None:
         if not isinstance(self.bundle, DailyTorchBundle):
             raise TypeError("bundle must be DailyTorchBundle")
@@ -312,9 +158,31 @@ class DailyTorchWorkflowResult:
         ):
             raise ValueError("best_validation_loss must be finite")
 
+    # 提供 Torch 最佳轮次、实际训练轮数与最佳验证损失的只读摘要。
+    @property
+    def fit_summary(self) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                "best_epoch": self.best_epoch,
+                "epochs_trained": self.epochs_trained,
+                "best_validation_loss": self.best_validation_loss,
+                "preprocessing": "STANDARD_SCALER_TRAIN_ONLY",
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedInferenceBundle:
+    """经过哈希校验、可供 DailyModelStrategy 使用的固定 bundle。"""
+
+    bundle: DailyTorchBundle
+    file_sha256: str
+    portfolio_json: str
+    source_run_dir: str
+
 
 class DailyTorchBundle:
-    """Inference bundle backed by a validated CPU torch state_dict."""
+    """权重以 CPU 数组保存，推理可独立选择 CPU 或 CUDA 的模型包。"""
 
     __slots__ = (
         "_best_epoch",
@@ -324,8 +192,10 @@ class DailyTorchBundle:
         "_metadata",
         "_scaler",
         "_state_dict",
+        "_device",
     )
 
+    # 保存模型元数据、网络工厂、训练集标准化器和最佳权重，校验推理所需状态。
     def __init__(
         self,
         *,
@@ -336,6 +206,7 @@ class DailyTorchBundle:
         best_epoch: int,
         epochs_trained: int,
         best_validation_loss: float,
+        device: str = "cpu",
     ) -> None:
         if not isinstance(metadata, ModelMetadata):
             raise TypeError("metadata must be ModelMetadata")
@@ -375,32 +246,45 @@ class DailyTorchBundle:
         self._best_epoch = best_epoch
         self._epochs_trained = epochs_trained
         self._best_validation_loss = best_loss
+        self._device = _resolve_torch_device(require_torch(), device)
         self._validate_state_dict()
 
+    @property
+    def device(self) -> str:
+        """返回当前推理设备；它可以不同于元数据中记录的历史训练设备。"""
+        return self._device
+
+    # 返回 Torch 模型包元数据。
     @property
     def metadata(self) -> ModelMetadata:
         return self._metadata
 
+    # 返回推理使用的训练集标准化器。
     @property
     def scaler(self) -> StandardScaler:
         return self._scaler
 
+    # 返回验证表现最佳的训练轮次。
     @property
     def best_epoch(self) -> int:
         return self._best_epoch
 
+    # 返回实际执行的训练轮数，可能因早停少于上限。
     @property
     def epochs_trained(self) -> int:
         return self._epochs_trained
 
+    # 返回最佳轮次的验证损失。
     @property
     def best_validation_loss(self) -> float:
         return self._best_validation_loss
 
+    # 提供保存的网络参数状态，供保存或重建推理网络。
     @property
     def state_dict(self) -> Mapping[str, np.ndarray[Any, Any]]:
         return MappingProxyType({name: value.copy() for name, value in self._state_dict.items()})
 
+    # 用训练集标准化器转换特征，在所选设备加载网络并推理，得分转回 CPU 后返回。
     def predict(self, records: Sequence[FeatureRecord]) -> tuple[PredictionRecord, ...]:
         supplied_records = cast(object, records)
         if isinstance(supplied_records, (str, bytes)) or not isinstance(supplied_records, Sequence):
@@ -419,7 +303,7 @@ class DailyTorchBundle:
         normalized = self._scaler.transform(matrix)
         torch = require_torch()
         model = self._new_model(torch)
-        tensor = torch.as_tensor(normalized, dtype=torch.float32, device="cpu")
+        tensor = torch.as_tensor(normalized, dtype=torch.float32, device=self._device)
         model.eval()
         with torch.no_grad():
             output = _flat_output(model(tensor), expected_rows=len(ordered))
@@ -429,6 +313,7 @@ class DailyTorchBundle:
             for record, score in zip(ordered, scores, strict=True)
         )
 
+    # 通过用户工厂创建符合特征宽度的网络，供权重校验与推理使用。
     def _new_model(self, torch: Any) -> Any:
         _seed_everything(torch, self._metadata.random_seed)
         model = self._factory.create(
@@ -437,18 +322,19 @@ class DailyTorchBundle:
         )
         if not isinstance(model, torch.nn.Module):
             raise TypeError("TorchModelFactory.create must return torch.nn.Module")
-        model.to("cpu")
+        model.to(self._device)
         tensors = {name: torch.as_tensor(value.copy()) for name, value in self._state_dict.items()}
         model.load_state_dict(tensors, strict=True)
         return model
 
+    # 检查保存权重与网络参数名称、形状等兼容性。
     def _validate_state_dict(self) -> None:
         torch = require_torch()
         self._new_model(torch)
 
 
 class DailyTorchWorkflow:
-    """Fit once, early-stop on validation, and persist a state_dict bundle."""
+    """只拟合一次，在验证集上 early stopping，并持久化 state_dict bundle。"""
 
     __slots__ = (
         "_bundle",
@@ -456,9 +342,12 @@ class DailyTorchWorkflow:
         "_factory",
         "_feature_builder",
         "_feature_names",
+        "_portfolio",
+        "_required_history",
         "_training_config",
     )
 
+    # 保存特征构建器、模型工厂、训练设置和数据身份，准备 Torch 工作流。
     def __init__(
         self,
         *,
@@ -466,8 +355,9 @@ class DailyTorchWorkflow:
         model_factory: TorchModelFactory,
         data_identity: ModelDataIdentity,
         training_config: TorchTrainingConfig | None = None,
+        portfolio: ModelPortfolioPolicy | None = None,
     ) -> None:
-        names, _ = validate_feature_builder(feature_builder)
+        names, required_history = validate_feature_builder(feature_builder)
         _validate_factory(model_factory)
         if not isinstance(data_identity, ModelDataIdentity):
             raise TypeError("data_identity must be ModelDataIdentity")
@@ -475,22 +365,35 @@ class DailyTorchWorkflow:
             training_config = TorchTrainingConfig()
         if not isinstance(training_config, TorchTrainingConfig):
             raise TypeError("training_config must be TorchTrainingConfig")
+        portfolio = portfolio or TopKPortfolio()
+        if not isinstance(portfolio, ModelPortfolioPolicy):
+            raise TypeError("portfolio must satisfy ModelPortfolioPolicy")
         self._feature_builder = feature_builder
         self._feature_names = names
+        self._required_history = required_history
+        self._portfolio = portfolio
         self._factory = model_factory
         self._data_identity = data_identity
         self._training_config = training_config
         self._bundle: DailyTorchBundle | None = None
 
+    # 返回已训练或已加载的 Torch 包，尚未准备好时按接口约定报错。
     @property
     def bundle(self) -> DailyTorchBundle | None:
         return self._bundle
 
+    # 返回 Torch 工作流默认产物文件名。
+    @property
+    def bundle_filename(self) -> str:
+        return "model_bundle.pt"
+
+    # 标准化器仅拟合训练集；网络和数据移到指定设备，早停后保存 CPU 权重副本。
     def fit(self, dataset: DatasetSplits) -> DailyTorchWorkflowResult:
         if self._bundle is not None:
             raise RuntimeError("DailyTorchWorkflow may fit or load only once")
-        self._validate_dataset_schema(dataset)
+        validate_dataset_schema(dataset, self._feature_names)
         torch = require_torch()
+        device = _resolve_torch_device(torch, self._training_config.device)
         seed = self._training_config.seed
         _seed_everything(torch, seed)
 
@@ -506,17 +409,17 @@ class DailyTorchWorkflow:
         model = self._factory.create(input_dim=len(self._feature_names), seed=seed)
         if not isinstance(model, torch.nn.Module):
             raise TypeError("TorchModelFactory.create must return torch.nn.Module")
-        model.to("cpu")
+        model.to(device)
         optimizer = torch.optim.Adam(
             model.parameters(),
             lr=float(self._training_config.learning_rate),
             weight_decay=float(self._training_config.weight_decay),
         )
         loss_function = torch.nn.MSELoss()
-        train_x = torch.as_tensor(normalized_train, dtype=torch.float32, device="cpu")
-        valid_x = torch.as_tensor(normalized_valid, dtype=torch.float32, device="cpu")
-        train_y = torch.as_tensor(train_targets, dtype=torch.float32, device="cpu")
-        valid_y = torch.as_tensor(valid_targets, dtype=torch.float32, device="cpu")
+        train_x = torch.as_tensor(normalized_train, dtype=torch.float32, device=device)
+        valid_x = torch.as_tensor(normalized_valid, dtype=torch.float32, device=device)
+        train_y = torch.as_tensor(train_targets, dtype=torch.float32, device=device)
+        valid_y = torch.as_tensor(valid_targets, dtype=torch.float32, device=device)
 
         best_loss = math.inf
         best_epoch = 0
@@ -564,25 +467,11 @@ class DailyTorchWorkflow:
         state_arrays = {
             name: value.detach().cpu().numpy().copy() for name, value in best_state.items()
         }
-        metadata = ModelMetadata(
-            schema_version=MODEL_BUNDLE_SCHEMA_VERSION,
-            model_id=self._factory.model_id,
-            model_class_name=self._factory.model_class_name,
-            model_parameters_json=canonical_json(self._factory.model_parameters),
-            training_parameters_json=canonical_json(self._training_config.to_parameters()),
-            feature_names=self._feature_names,
-            feature_fingerprint=feature_fingerprint(
-                self._feature_names, DAILY_FORWARD_RETURN_LABEL
-            ),
-            label_name=DAILY_FORWARD_RETURN_LABEL,
-            train_range=dataset.train_range,
-            valid_range=dataset.valid_range,
-            test_range=dataset.test_range,
-            random_seed=seed,
-            data_identity=self._data_identity,
-            trained_through=dataset.trained_through,
-            framework_name="torch",
-            framework_version=str(torch.__version__),
+        metadata = build_model_metadata(
+            model=self._factory, training_parameters=self._training_config.to_parameters(),
+            feature_names=self._feature_names, dataset=dataset,
+            random_seed=self._training_config.seed, data_identity=self._data_identity,
+            framework_name="torch", framework_version=str(torch.__version__),
         )
         bundle = DailyTorchBundle(
             metadata=metadata,
@@ -592,6 +481,7 @@ class DailyTorchWorkflow:
             best_epoch=best_epoch,
             epochs_trained=epochs_trained,
             best_validation_loss=best_loss,
+            device=device,
         )
         self._bundle = bundle
         validation_predictions = bundle.predict(dataset.valid)
@@ -613,16 +503,24 @@ class DailyTorchWorkflow:
             best_validation_loss=best_loss,
         )
 
-    def save(self, path: Path) -> Path:
+    # 将网络权重、标准化器、元数据与推理所需信息保存为 Torch 产物。
+    def save(self, path: Path, *, source_run_dir: Path | None = None) -> Path:
         if self._bundle is None:
             raise RuntimeError("DailyTorchWorkflow has no bundle to save")
         torch = require_torch()
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        run_directory = Path(source_run_dir or target.parent).resolve()
         temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
         payload = {
             "bundle_format": TORCH_BUNDLE_FORMAT,
+            "bundle_format_version": INFERENCE_BUNDLE_FORMAT_VERSION,
             "metadata": self._bundle.metadata.to_dict(),
+            "inference": build_inference_payload(
+                metadata=self._bundle.metadata, feature_names=self._feature_names,
+                required_history=self._required_history, portfolio=self._portfolio,
+                source_run_dir=run_directory,
+            ),
             "scaler": _scaler_payload(self._bundle.scaler),
             "state_dict": {
                 name: torch.as_tensor(value.copy())
@@ -641,56 +539,33 @@ class DailyTorchWorkflow:
             temporary.unlink(missing_ok=True)
         return target
 
-    def load(self, path: Path, *, dataset: DatasetSplits) -> DailyTorchBundle:
+    # 加载 Torch 产物并检查与当前特征、模型工厂和配置兼容，恢复可推理包。
+    def load(
+        self, path: Path, *, dataset: DatasetSplits, device: str | None = None,
+    ) -> DailyTorchBundle:
         if self._bundle is not None:
             raise RuntimeError("DailyTorchWorkflow may fit or load only once")
-        self._validate_dataset_schema(dataset)
+        validate_dataset_schema(dataset, self._feature_names)
         source = Path(path)
         if not source.is_file():
             raise FileNotFoundError(source)
         torch = require_torch()
-        try:
-            raw_payload = torch.load(source, map_location="cpu", weights_only=False)
-        except TypeError:  # pragma: no cover - compatibility with older torch
-            raw_payload = torch.load(source, map_location="cpu")
-        if not isinstance(raw_payload, Mapping):
-            raise TorchBundleCompatibilityError("torch bundle payload must be a mapping")
+        raw_payload = _load_payload(source, torch)
         if raw_payload.get("bundle_format") != TORCH_BUNDLE_FORMAT:
             raise TorchBundleCompatibilityError("unsupported torch bundle format")
         metadata = ModelMetadata.from_mapping(
-            _required_mapping(raw_payload, "metadata", "metadata")
+            _required_mapping(raw_payload, "metadata")
         )
         self._validate_metadata(metadata, dataset)
-        scaler = _restore_scaler(_required_mapping(raw_payload, "scaler", "scaler"))
-        raw_state = _required_mapping(raw_payload, "state_dict", "state_dict")
-        state_arrays: dict[str, np.ndarray[Any, Any]] = {}
-        for raw_name, raw_value in raw_state.items():
-            if not isinstance(raw_name, str) or not raw_name:
-                raise TorchBundleCompatibilityError("state_dict keys must be nonblank strings")
-            if not hasattr(raw_value, "detach"):
-                raise TorchBundleCompatibilityError("state_dict values must be torch tensors")
-            state_arrays[raw_name] = raw_value.detach().cpu().numpy().copy()
-        summary = _required_mapping(raw_payload, "fit_summary", "fit_summary")
-        bundle = DailyTorchBundle(
-            metadata=metadata,
-            scaler=scaler,
-            factory=self._factory,
-            state_dict=state_arrays,
-            best_epoch=_required_int(summary, "best_epoch"),
-            epochs_trained=_required_int(summary, "epochs_trained"),
-            best_validation_loss=_required_float(summary, "best_validation_loss"),
+        bundle = _restore_bundle(
+            raw_payload, metadata, self._factory,
+            device=self._training_config.device if device is None else device,
         )
         self._bundle = bundle
         return bundle
 
-    def _validate_dataset_schema(self, dataset: DatasetSplits) -> None:
-        if not isinstance(dataset, DatasetSplits):
-            raise TypeError("dataset must be DatasetSplits")
-        if dataset.feature_names != self._feature_names:
-            raise ValueError("dataset feature_names do not match FeatureBuilder")
-        if dataset.label_name != DAILY_FORWARD_RETURN_LABEL:
-            raise ValueError("dataset label does not match the daily forward-return contract")
 
+    # 核对 Torch 产物元数据与当前工作流期望的身份及模式。
     def _validate_metadata(self, metadata: ModelMetadata, dataset: DatasetSplits) -> None:
         expected = {
             "model_id": self._factory.model_id,
@@ -709,9 +584,7 @@ class DailyTorchWorkflow:
             "data_identity": self._data_identity,
             "trained_through": dataset.trained_through,
         }
-        for field_name, expected_value in expected.items():
-            if getattr(metadata, field_name) != expected_value:
-                raise TorchBundleCompatibilityError(f"bundle metadata mismatch for {field_name}")
+        validate_model_metadata(metadata, expected, TorchBundleCompatibilityError)
         if metadata.framework_name != "torch":
             raise TorchBundleCompatibilityError("bundle framework_name must be torch")
         current_torch = require_torch()
@@ -721,6 +594,121 @@ class DailyTorchWorkflow:
             raise TorchBundleCompatibilityError("bundle torch major version is incompatible")
 
 
+def load_daily_torch_bundle_for_inference(
+    path: Path,
+    *,
+    feature_builder: FeatureBuilder,
+    model_factory: TorchModelFactory,
+    portfolio: ModelPortfolioPolicy,
+    signal_date: date,
+    expected_sha256: str | None = None,
+    expected_model_id: str | None = None,
+    device: str = "cpu",
+) -> LoadedInferenceBundle:
+    """加载并严格校验单个固定 bundle，不拟合任何模型。"""
+
+    source = Path(path)
+    actual_sha256 = bundle_sha256(source)
+    if expected_sha256 is not None and actual_sha256 != expected_sha256.lower():
+        raise TorchBundleCompatibilityError("model bundle SHA-256 does not match deployment")
+    feature_names, required_history = validate_feature_builder(feature_builder)
+    _validate_factory(model_factory)
+    if not isinstance(portfolio, ModelPortfolioPolicy):
+        raise TypeError("portfolio must satisfy ModelPortfolioPolicy")
+    if expected_model_id is not None and model_factory.model_id != expected_model_id:
+        raise TorchBundleCompatibilityError("Model source model_id does not match deployment")
+    torch = require_torch()
+    raw_payload = _load_payload(source, torch)
+    if raw_payload.get("bundle_format") != TORCH_BUNDLE_FORMAT:
+        raise TorchBundleCompatibilityError(
+            "unsupported torch bundle format; retrain the model to create a Live bundle"
+        )
+    if raw_payload.get("bundle_format_version") != INFERENCE_BUNDLE_FORMAT_VERSION:
+        raise TorchBundleCompatibilityError("unsupported inference bundle format version")
+    metadata = ModelMetadata.from_mapping(_required_mapping(raw_payload, "metadata"))
+    expected = {
+        "model_id": model_factory.model_id,
+        "model_class_name": model_factory.model_class_name,
+        "model_parameters_json": canonical_json(model_factory.model_parameters),
+        "feature_names": feature_names,
+        "feature_fingerprint": feature_fingerprint(feature_names, DAILY_FORWARD_RETURN_LABEL),
+    }
+    validate_model_metadata(
+        metadata, expected, TorchBundleCompatibilityError, signal_date=signal_date,
+    )
+
+    inference = _required_mapping(raw_payload, "inference")
+    expected_portfolio_json, source_run_dir = validate_inference_payload(
+        inference, feature_names=feature_names, required_history=required_history,
+        portfolio=portfolio, metadata=metadata, error_type=TorchBundleCompatibilityError,
+    )
+
+    bundle = _restore_bundle(raw_payload, metadata, model_factory, device=device)
+    saved_major = metadata.framework_version.split(".", maxsplit=1)[0]
+    current_major = str(torch.__version__).split(".", maxsplit=1)[0]
+    if metadata.framework_name != "torch" or saved_major != current_major:
+        raise TorchBundleCompatibilityError("bundle torch runtime is incompatible")
+    return LoadedInferenceBundle(
+        bundle=bundle,
+        file_sha256=actual_sha256,
+        portfolio_json=expected_portfolio_json,
+        source_run_dir=source_run_dir,
+    )
+
+
+def _load_payload(source: Path, torch: Any) -> Mapping[str, object]:
+    """两个加载入口共用文件读取；各自的兼容性要求仍在调用处检查。"""
+    try:
+        payload = torch.load(source, map_location="cpu", weights_only=False)
+    except TypeError:  # pragma: no cover - 兼容旧版 torch
+        payload = torch.load(source, map_location="cpu")
+    if not isinstance(payload, Mapping):
+        raise TorchBundleCompatibilityError("torch bundle payload must be a mapping")
+    return payload
+
+
+# 从序列化字段恢复元数据、标准化器和网络权重，构造可推理 Torch 包。
+def _restore_bundle(
+    payload: Mapping[str, object], metadata: ModelMetadata, factory: TorchModelFactory,
+    *, device: str = "cpu",
+) -> DailyTorchBundle:
+    scaler = _restore_scaler(_required_mapping(payload, "scaler"))
+    raw_state = _required_mapping(payload, "state_dict")
+    state_arrays: dict[str, np.ndarray[Any, Any]] = {}
+    for name, value in raw_state.items():
+        if not isinstance(name, str) or not name:
+            raise TorchBundleCompatibilityError("state_dict keys must be nonblank strings")
+        if not hasattr(value, "detach"):
+            raise TorchBundleCompatibilityError("state_dict values must be torch tensors")
+        state_arrays[name] = value.detach().cpu().numpy().copy()
+    summary = _required_mapping(payload, "fit_summary")
+    return DailyTorchBundle(
+        metadata=metadata, scaler=scaler, factory=factory, state_dict=state_arrays,
+        best_epoch=_required_int(summary, "best_epoch"),
+        epochs_trained=_required_int(summary, "epochs_trained"),
+        best_validation_loss=_required_float(summary, "best_validation_loss"),
+        device=device,
+    )
+
+
+def _resolve_torch_device(torch: Any, value: str) -> str:
+    """校验 CUDA 可用性与设备编号；显式选择 GPU 时不允许回退到 CPU。"""
+    device = normalize_model_device(value)
+    if device == "cpu":
+        return device
+    # 在 CUDA 运算前配置 cuBLAS 工作空间，配合已有的确定性算法开关。
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"Torch device {device!r} requested, but CUDA is unavailable; "
+            "use device='cpu' or install a CUDA-enabled PyTorch build with a compatible GPU/driver"
+        )
+    if ":" in device and int(device.split(":", 1)[1]) >= torch.cuda.device_count():
+        raise RuntimeError(f"Torch device {device!r} does not exist")
+    return device
+
+
+# 检查用户工厂满足 Torch 模型创建与身份参数接口。
 def _validate_factory(factory: TorchModelFactory) -> None:
     if not isinstance(factory, TorchModelFactory):
         raise TypeError("model_factory must satisfy TorchModelFactory")
@@ -731,6 +719,7 @@ def _validate_factory(factory: TorchModelFactory) -> None:
     canonical_json(factory.model_parameters)
 
 
+# 设置训练使用的随机源与确定性选项，减少重复运行差异。
 def _seed_everything(torch: Any, seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed % (2**32 - 1))
@@ -744,6 +733,7 @@ def _seed_everything(torch: Any, seed: int) -> None:
         torch.backends.cudnn.benchmark = False
 
 
+# 把网络输出整理为每个样本一个得分，并检查输出形状。
 def _flat_output(value: Any, *, expected_rows: int) -> Any:
     flattened = value.reshape(-1)
     if int(flattened.numel()) != expected_rows:
@@ -751,63 +741,7 @@ def _flat_output(value: Any, *, expected_rows: int) -> Any:
     return flattened
 
 
-def _feature_matrix(
-    records: Sequence[FeatureRecord],
-    feature_count: int,
-) -> np.ndarray[Any, np.dtype[np.float64]]:
-    matrix = np.asarray(
-        [[float(value) for value in record.features] for record in records],
-        dtype=np.float64,
-    )
-    if matrix.ndim != 2 or matrix.shape != (len(records), feature_count):
-        raise ValueError("feature matrix has an invalid shape")
-    if not np.isfinite(matrix).all():
-        raise ValueError("feature matrix must be finite")
-    return matrix
-
-
-def _target_vector(
-    records: Sequence[LabeledRecord],
-) -> np.ndarray[Any, np.dtype[np.float64]]:
-    target = np.asarray([float(record.label) for record in records], dtype=np.float64)
-    if target.shape != (len(records),) or not np.isfinite(target).all():
-        raise ValueError("target vector must be finite and one-dimensional")
-    return target
-
-
-def evaluate_predictions(
-    *,
-    samples: Sequence[LabeledRecord],
-    predictions: Sequence[PredictionRecord],
-) -> RegressionMetricReport:
-    ordered = tuple(sorted(samples, key=lambda sample: sample.key))
-    if not ordered or any(not isinstance(sample, LabeledRecord) for sample in ordered):
-        raise ValueError("samples must contain labeled records")
-    by_key: dict[object, PredictionRecord] = {}
-    for prediction in predictions:
-        if not isinstance(prediction, PredictionRecord):
-            raise TypeError("predictions may contain only PredictionRecord values")
-        if prediction.key in by_key:
-            raise ValueError("predictions contain duplicate keys")
-        by_key[prediction.key] = prediction
-    expected_keys = tuple(sample.key for sample in ordered)
-    if frozenset(by_key) != frozenset(expected_keys):
-        raise ValueError("predictions must exactly match sample keys")
-    target = _target_vector(ordered)
-    score = np.asarray([by_key[key].score for key in expected_keys], dtype=np.float64)
-    error = score - target
-    if np.std(score) == 0.0 or np.std(target) == 0.0:
-        correlation = 0.0
-    else:
-        correlation = float(np.corrcoef(score, target)[0, 1])
-    return RegressionMetricReport(
-        sample_count=len(ordered),
-        mean_squared_error=float(np.mean(error**2)),
-        mean_absolute_error=float(np.mean(np.abs(error))),
-        prediction_correlation=correlation,
-    )
-
-
+# 提取标准化器的均值、缩放和样本数等可保存状态。
 def _scaler_payload(scaler: StandardScaler) -> dict[str, object]:
     return {
         "mean": np.asarray(scaler.mean_, dtype=np.float64),
@@ -818,6 +752,7 @@ def _scaler_payload(scaler: StandardScaler) -> dict[str, object]:
     }
 
 
+# 从保存状态重建标准化器，供推理使用训练时的变换。
 def _restore_scaler(value: Mapping[str, object]) -> StandardScaler:
     try:
         mean = np.asarray(value["mean"], dtype=np.float64)
@@ -846,20 +781,21 @@ def _restore_scaler(value: Mapping[str, object]) -> StandardScaler:
     return scaler
 
 
+# 读取模型产物中必需的映射字段。
 def _required_mapping(
     value: Mapping[str, object],
     key: str,
-    field_name: str,
 ) -> Mapping[str, object]:
     try:
         result = value[key]
     except KeyError as exc:
-        raise TorchBundleCompatibilityError(f"{field_name} is missing") from exc
+        raise TorchBundleCompatibilityError(f"{key} is missing") from exc
     if not isinstance(result, Mapping):
-        raise TorchBundleCompatibilityError(f"{field_name} must be a mapping")
+        raise TorchBundleCompatibilityError(f"{key} must be a mapping")
     return result
 
 
+# 读取模型产物中必需的整数字段。
 def _required_int(value: Mapping[str, object], key: str) -> int:
     try:
         result = value[key]
@@ -870,6 +806,7 @@ def _required_int(value: Mapping[str, object], key: str) -> int:
     return result
 
 
+# 读取模型产物中必需的有限浮点字段。
 def _required_float(value: Mapping[str, object], key: str) -> float:
     try:
         result = value[key]
@@ -883,17 +820,24 @@ def _required_float(value: Mapping[str, object], key: str) -> float:
     return converted
 
 
+# Backward-compatible import alias for existing user models and tests.
+DailyTorchDatasetBuilder = DailyModelDatasetBuilder
+
+
 __all__ = [
-    "FOUR_FACTOR_FEATURE_NAMES",
+    "INFERENCE_BUNDLE_FORMAT_VERSION",
     "TORCH_BUNDLE_FORMAT",
-    "DailyFourFactorFeatureBuilder",
+    "DailyModelDatasetBuilder",
     "DailyTorchBundle",
     "DailyTorchDatasetBuilder",
     "DailyTorchWorkflow",
     "DailyTorchWorkflowResult",
+    "LoadedInferenceBundle",
     "TorchBundleCompatibilityError",
     "TorchTrainingConfig",
     "TorchUnavailableError",
+    "bundle_sha256",
     "evaluate_predictions",
+    "load_daily_torch_bundle_for_inference",
     "require_torch",
 ]

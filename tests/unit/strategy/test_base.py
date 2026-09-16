@@ -1,4 +1,4 @@
-"""The common strategy boundary rejects future adjusted views."""
+"""共用策略边界拒绝未来复权视图的测试。"""
 
 from datetime import date
 from decimal import Decimal
@@ -36,7 +36,7 @@ class _ProbeStrategy(BaseStrategy):
         return True
 
     def _generate_target(self, **_kwargs: object) -> TargetPortfolio:
-        return TargetPortfolio(weights={})
+        return TargetPortfolio(weights={"SH.510300": Decimal("0")})
 
 
 @pytest.mark.unit

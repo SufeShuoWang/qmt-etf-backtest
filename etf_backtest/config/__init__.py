@@ -1,4 +1,4 @@
-"""Public configuration API."""
+"""公开配置 API。"""
 
 from etf_backtest.config.schema import (
     BacktestConfig,

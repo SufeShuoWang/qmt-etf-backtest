@@ -1,4 +1,4 @@
-"""Fixed-name trusted local Rule loader tests."""
+"""固定名称可信本地 Rule 加载器测试。"""
 
 from __future__ import annotations
 

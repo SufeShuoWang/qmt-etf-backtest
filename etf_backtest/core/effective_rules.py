@@ -1,6 +1,7 @@
-"""Manifest-verified effective-dated ETF turnover and price-limit rules."""
+"""经清单校验且带生效日期的 ETF 周转与涨跌停规则。"""
 
 from __future__ import annotations
+
 
 import csv
 import hashlib
@@ -9,13 +10,14 @@ import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, cast
 
+from etf_backtest.validation import non_blank as _non_blank, plain_date as _plain_date
 from etf_backtest.config.schema import normalize_symbol
 from etf_backtest.core.market import (
     EtfCategory,
@@ -51,28 +53,14 @@ _SHA256: Final = re.compile(r"^[0-9a-f]{64}$")
 
 
 class RuleResolutionError(LookupError):
-    """No unambiguous effective rule exists for a symbol/date."""
+    """指定证券和日期不存在唯一明确的有效规则。"""
 
 
 class RuleResourceValidationError(ValueError):
-    """The frozen CSV and manifest do not form a valid rule resource."""
+    """冻结 CSV 与清单无法组成有效规则资源。"""
 
 
-def _plain_date(value: object, field_name: str) -> date:
-    if isinstance(value, datetime) or not isinstance(value, date):
-        raise TypeError(f"{field_name} must be datetime.date")
-    return value
-
-
-def _non_blank(value: object, field_name: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be a string")
-    normalized = value.strip()
-    if not normalized:
-        raise ValueError(f"{field_name} must not be blank")
-    return normalized
-
-
+# 从规则资源清单中读取映射字段，类型错误时立即报错。
 def _manifest_mapping(
     container: Mapping[str, object],
     key: str,
@@ -83,6 +71,7 @@ def _manifest_mapping(
     return cast(dict[str, object], value)
 
 
+# 从规则资源清单中读取非空文本字段。
 def _manifest_text(container: Mapping[str, object], key: str) -> str:
     value = container.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -90,6 +79,7 @@ def _manifest_text(container: Mapping[str, object], key: str) -> str:
     return value.strip()
 
 
+# 从规则资源清单中读取整数，拒绝布尔值等不符合约定的输入。
 def _manifest_int(container: Mapping[str, object], key: str) -> int:
     value = container.get(key)
     if type(value) is not int or value < 0:
@@ -97,6 +87,7 @@ def _manifest_int(container: Mapping[str, object], key: str) -> int:
     return value
 
 
+# 检查清单中的字符串序列并转为元组，便于稳定记录资源身份。
 def _manifest_string_tuple(container: Mapping[str, object], key: str) -> tuple[str, ...]:
     value = container.get(key)
     if not isinstance(value, list) or any(
@@ -108,13 +99,14 @@ def _manifest_string_tuple(container: Mapping[str, object], key: str) -> tuple[s
 
 @dataclass(frozen=True, slots=True)
 class RuleProvenance:
-    """Frozen identity and approximation status of one rule assertion."""
+    """单条规则断言的冻结身份和近似状态。"""
 
     source: str
     version: str
     method: str
     approximate: bool
 
+    # 校验规则来源标识、说明等溯源字段。
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", _non_blank(self.source, "source"))
         object.__setattr__(self, "version", _non_blank(self.version, "version"))
@@ -125,7 +117,7 @@ class RuleProvenance:
 
 @dataclass(frozen=True, slots=True)
 class RuleResourceIdentity:
-    """Integrity identity suitable for inclusion in local run metadata."""
+    """可写入本地运行元数据的完整性身份信息。"""
 
     resource_name: str
     resource_version: str
@@ -133,6 +125,7 @@ class RuleResourceIdentity:
     manifest_sha256: str
     csv_sha256: str
 
+    # 校验规则资源名称、版本、模式以及清单和 CSV 的 SHA-256 格式。
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
@@ -153,7 +146,7 @@ class RuleResourceIdentity:
 
 @dataclass(frozen=True, slots=True)
 class EtfRulePeriod:
-    """One inclusive effective interval for all execution-facing ETF rules."""
+    """面向执行的全部 ETF 规则共用的单个闭合生效区间。"""
 
     symbol: str
     effective_from: date
@@ -165,6 +158,7 @@ class EtfRulePeriod:
     tick_size: Decimal
     provenance: RuleProvenance
 
+    # 检查规则生效区间、证券代码及交易参数是否合法。
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
         start = _plain_date(self.effective_from, "effective_from")
@@ -178,12 +172,14 @@ class EtfRulePeriod:
             raise TypeError("provenance must be RuleProvenance")
         self.to_rule()
 
+    # 判断某个交易日是否落在本条规则的生效区间内。
     def contains(self, trade_date: date) -> bool:
         value = _plain_date(trade_date, "trade_date")
         return self.effective_from <= value and (
             self.effective_to is None or value <= self.effective_to
         )
 
+    # 将带生效区间的规则记录转换为当日使用的 EtfTradingRule。
     def to_rule(self) -> EtfTradingRule:
         return EtfTradingRule(
             symbol=self.symbol,
@@ -197,7 +193,7 @@ class EtfRulePeriod:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedEtfRule:
-    """Domain rule plus the effective-period evidence used to construct it."""
+    """领域规则及构造该规则所依据的生效期证据。"""
 
     rule: EtfTradingRule
     effective_from: date
@@ -206,8 +202,9 @@ class ResolvedEtfRule:
 
 
 class EffectiveDatedEtfRuleResolver:
-    """Strict, deterministic resolver used by the engine once per symbol/date."""
+    """引擎按证券和日期逐次调用的严格确定性解析器。"""
 
+    # 索引各证券的规则区间，校验区间冲突并保存资源身份。
     def __init__(
         self,
         periods: Sequence[EtfRulePeriod],
@@ -237,25 +234,29 @@ class EffectiveDatedEtfRuleResolver:
         )
         self._resource_identity = resource_identity
 
+    # 返回已经建立有效期规则的证券集合。
     @property
     def symbols(self) -> tuple[str, ...]:
         return tuple(self._periods_by_symbol)
 
+    # 返回规则区间记录，供审计和测试检查。
     @property
     def periods(self) -> tuple[EtfRulePeriod, ...]:
         return tuple(
             period for symbol in self.symbols for period in self._periods_by_symbol[symbol]
         )
 
+    # 返回 CSV 与清单对应的已校验资源身份。
     @property
     def resource_identity(self) -> RuleResourceIdentity | None:
         return self._resource_identity
 
     def resolve(self, symbol: str, trade_date: date) -> EtfTradingRule:
-        """Resolve exactly one rule or fail closed on an uncovered date."""
+        """解析唯一规则；日期未覆盖时按失败关闭原则拒绝。"""
 
         return self.resolve_with_provenance(symbol, trade_date).rule
 
+    # 按证券和交易日定位唯一有效规则，同时返回其来源信息。
     def resolve_with_provenance(self, symbol: str, trade_date: date) -> ResolvedEtfRule:
         canonical = normalize_symbol(symbol)
         value = _plain_date(trade_date, "trade_date")
@@ -277,6 +278,7 @@ class EffectiveDatedEtfRuleResolver:
         )
 
 
+# 保存 CSV 中一条 20% 涨跌幅规则的证券、生效日期和来源字段。
 @dataclass(frozen=True, slots=True)
 class _TwentyPercentResourcePeriod:
     symbol: str
@@ -287,12 +289,14 @@ class _TwentyPercentResourcePeriod:
     source_id: str
 
 
+# 集中携带已读取的特殊涨跌幅规则与清单身份。
 @dataclass(frozen=True, slots=True)
 class _LoadedRuleResource:
     identity: RuleResourceIdentity
     periods: tuple[_TwentyPercentResourcePeriod, ...]
 
 
+# 读取规则 JSON 清单并校验顶层结构。
 def _read_manifest(path: Path) -> tuple[Mapping[str, object], str]:
     try:
         payload = path.read_bytes()
@@ -307,6 +311,7 @@ def _read_manifest(path: Path) -> tuple[Mapping[str, object], str]:
     return cast(dict[str, object], loaded), hashlib.sha256(payload).hexdigest()
 
 
+# 提取清单声明的来源标识，供 CSV 来源一致性检查使用。
 def _manifest_source_ids(manifest: Mapping[str, object]) -> frozenset[str]:
     sources = manifest.get("sources")
     if not isinstance(sources, list) or not sources:
@@ -322,6 +327,7 @@ def _manifest_source_ids(manifest: Mapping[str, object]) -> frozenset[str]:
     return frozenset(source_ids)
 
 
+# 读取清单中的分类计数，供实际 CSV 行数核对。
 def _manifest_count_mapping(
     container: Mapping[str, object],
     key: str,
@@ -337,6 +343,7 @@ def _manifest_count_mapping(
     return MappingProxyType(counts)
 
 
+# 将规则资源中的 ISO 日期文本转换为日期对象，并报告字段错误。
 def _parse_iso_date(value: str, field_name: str) -> date:
     try:
         parsed = date.fromisoformat(value)
@@ -347,6 +354,7 @@ def _parse_iso_date(value: str, field_name: str) -> date:
     return parsed
 
 
+# 读取 CSV 中的规则区间，校验列、证券、日期及来源约束。
 def _read_csv_periods(
     *,
     csv_path: Path,
@@ -453,6 +461,7 @@ def _read_csv_periods(
     return tuple(periods)
 
 
+# 联合加载规则 CSV 和清单，核对摘要与统计后返回已校验资源。
 def _load_rule_resource(csv_path: Path, manifest_path: Path) -> _LoadedRuleResource:
     manifest, manifest_digest = _read_manifest(manifest_path)
     resource_name = _manifest_text(manifest, "resource_name")
@@ -511,16 +520,19 @@ def _load_rule_resource(csv_path: Path, manifest_path: Path) -> _LoadedRuleResou
     )
 
 
+# 根据 ETF 主表信息判断是否属于支持的黄金 ETF 类型。
 def _is_gold(info: EtfInfo) -> bool:
     return info.primary_category == _DOMESTIC_CATEGORY and info.symbol.partition(".")[2].startswith(
         "518"
     )
 
 
+# 根据 ETF 主表信息判断是否属于支持的境内股票 ETF 类型。
 def _is_domestic_stock(info: EtfInfo) -> bool:
     return info.primary_category == _DOMESTIC_CATEGORY and info.fund_type == _STOCK_FUND_TYPE
 
 
+# 构造一个带来源说明的有效期规则区间，供默认规则与特殊规则拼接。
 def _period(
     *,
     info: EtfInfo,
@@ -546,6 +558,7 @@ def _period(
     )
 
 
+# 将境内股票 ETF 的特殊 20% 区间与默认区间组合为完整规则时间线。
 def _stock_periods(
     *,
     info: EtfInfo,
@@ -639,12 +652,11 @@ def load_effective_rule_resolver(
     lot_size: int = 100,
     tick_size: Decimal = Decimal("0.001"),
 ) -> EffectiveDatedEtfRuleResolver:
-    """Verify the frozen resource and build complete lifecycle rule periods.
+    """校验冻结资源并构建完整生命周期规则区间。
 
-    The CSV contains only 20% exceptions.  Every uncovered domestic stock ETF
-    date receives the auditable 10% fallback.  A finite ``valid_to`` is
-    inclusive and is followed by a restored 10% period.  Gold ETFs remain 10%
-    regardless of any accidental resource membership.
+    CSV 只记录 20% 的例外情形。未覆盖的境内股票 ETF 日期采用可审计的 10% 回退规则；
+    有限的 ``valid_to`` 为闭区间终点，其后恢复为 10%。黄金 ETF 即使意外出现在资源中，
+    也始终使用 10%。
     """
 
     if not isinstance(etf_infos, Sequence):

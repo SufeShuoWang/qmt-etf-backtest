@@ -1,4 +1,4 @@
-"""Frozen calculation contract for the core daily backtest loop."""
+"""核心日频回测循环的冻结计算契约。"""
 
 from __future__ import annotations
 

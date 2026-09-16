@@ -1,4 +1,4 @@
-"""Render full-period charts after a daily backtest has completed."""
+"""日频回测完成后绘制全周期图表。"""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from etf_backtest.evaluation.backtest_metrics import DailyMetricRow
 _ZERO = Decimal("0")
 
 
+# 校验绘图日数据并按日期整理，保证横轴顺序一致。
 def _ordered_rows(daily_rows: Sequence[DailyMetricRow]) -> tuple[DailyMetricRow, ...]:
     if not isinstance(daily_rows, Sequence):
         raise TypeError("daily_rows must be a sequence")
@@ -32,6 +33,7 @@ def _ordered_rows(daily_rows: Sequence[DailyMetricRow]) -> tuple[DailyMetricRow,
     return ordered
 
 
+# 创建用于离线结果绘制的 Matplotlib 图形。
 def _new_figure(*, title: str, ylabel: str) -> tuple[Figure, Axes]:
     figure = Figure(figsize=(11, 4.8), dpi=160, layout="constrained")
     FigureCanvasAgg(figure)
@@ -51,6 +53,7 @@ def _new_figure(*, title: str, ylabel: str) -> tuple[Figure, Axes]:
     return figure, axis
 
 
+# 将图形编码成 PNG 字节，交给结果写入器保存。
 def _png_bytes(figure: Figure) -> bytes:
     output = BytesIO()
     figure.savefig(output, format="png", dpi=160, facecolor="white")
@@ -62,7 +65,7 @@ def render_backtest_plots(
     initial_cash: Decimal,
     daily_rows: Sequence[DailyMetricRow],
 ) -> dict[str, bytes]:
-    """Return the three final charts for the complete backtest period."""
+    """返回覆盖完整回测周期的三张最终图表。"""
 
     if not isinstance(initial_cash, Decimal):
         raise TypeError("initial_cash must be Decimal")
@@ -70,7 +73,7 @@ def render_backtest_plots(
         raise ValueError("initial_cash must be finite and positive")
     ordered = _ordered_rows(daily_rows)
     dates = tuple(row.trade_date for row in ordered)
-    plot_dates: Any = dates  # Matplotlib accepts dates although its stubs omit them.
+    plot_dates: Any = dates  # Matplotlib 支持日期参数，但类型存根未声明。
 
     cumulative_returns = tuple(float(row.total_asset / initial_cash - 1) for row in ordered)
     cumulative_figure, cumulative_axis = _new_figure(

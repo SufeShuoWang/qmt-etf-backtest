@@ -1,13 +1,19 @@
 # Model 策略接口手册
 
 本文档说明用户在 `private_strategy/<策略名>/model.py` 中可以编辑的 Model 扩展接口。用户负责
-定义特征、PyTorch 网络和模型个性参数；框架统一负责样本标签、数据切分、训练集标准化、
+定义特征、Torch/XGBoost 模型和个性参数；框架统一负责样本标签、数据切分、训练、
 训练、验证集早停、逐日预测、组合权重、订单、撮合和账户记账。
 
-运行 Model 需要安装带 PyTorch 的依赖：
+运行 Torch Model 需要安装 PyTorch 依赖：
 
 ```powershell
 python -m pip install -e ".[deep]"
+```
+
+XGBoost Model 只需安装对应的可选依赖：
+
+```powershell
+python -m pip install -e ".[xgboost]"
 ```
 
 ## 1. model.py 必须提供什么
@@ -20,9 +26,12 @@ MODEL_SETTINGS = ModelSettings(...)
 class Features(FeatureBuilder):
     ...
 
-class Model(TorchModelFactory):
+class Model(TorchModelFactory):  # backend="torch" 时
     ...
 ```
+
+`backend="xgboost"` 时 `Model` 不继承 `TorchModelFactory`，只实现模型身份与
+`model_parameters`。
 
 实验的 `experiment.yaml` 必须使用：
 
@@ -36,6 +45,7 @@ case: model
 
 ```python
 MODEL_SETTINGS = ModelSettings(
+    backend="torch",
     train_range=DateRange(date(2021, 1, 1), date(2022, 12, 31)),
     valid_range=DateRange(date(2023, 1, 1), date(2023, 12, 31)),
     portfolio=TopKPortfolio(
@@ -45,6 +55,7 @@ MODEL_SETTINGS = ModelSettings(
         weighting="score_proportional",
     ),
     training=TorchTrainingConfig(
+        device="cpu",  # 使用 GPU 时改为 "cuda" 或 "cuda:0"。
         seed=42,
         max_epochs=100,
         patience=10,
@@ -58,10 +69,11 @@ MODEL_SETTINGS = ModelSettings(
 
 | 字段 | 作用 |
 |---|---|
+| `backend` | `torch` 或 `xgboost`；省略时保持现有 `torch` 行为 |
 | `train_range` | 训练样本的信号日闭区间 |
 | `valid_range` | 验证和早停样本的信号日闭区间 |
 | `portfolio` | 每日预测分数如何转换为目标权重 |
-| `training` | PyTorch 训练参数 |
+| `training` | 与 backend 匹配的 `TorchTrainingConfig` 或 `XGBoostTrainingConfig` |
 | `feature_kwargs` | 传给 `Features(...)` 构造函数的关键字参数 |
 | `model_kwargs` | 传给 `Model(...)` 构造函数的关键字参数 |
 
@@ -174,7 +186,8 @@ Model 特征看不到现金、持仓、ETF 份额、汇金持有比例、指数�
 - `valid_range`：验证和早停；
 - `experiment.yaml` 的日期区间：测试集和正式回测期。
 
-StandardScaler 只在训练集拟合，然后应用于验证集和测试集。训练、验证和测试每个区间都必须
+Torch 后端的 StandardScaler 只在训练集拟合，然后应用于验证集和测试集；
+XGBoost 后端不做标准化。训练、验证和测试每个区间都必须
 产生至少一个有效样本。一次回测只训练一次，不会在回测过程中逐日重新训练。
 
 ## 5. Model 网络工厂接口
@@ -236,6 +249,7 @@ def create(self, *, input_dim: int, seed: int) -> object:
 | 字段 | 含义 |
 |---|---|
 | `seed` | 非负随机种子 |
+| `device` | 每个策略独立设置，默认 `"cpu"`；`"cuda"` 使用 GPU，`"cuda:0"` 指定第一张可见 GPU |
 | `max_epochs` | 最大训练轮数 |
 | `patience` | 验证集连续多少轮无足够改善后早停 |
 | `batch_size` | 小批量大小 |
@@ -243,8 +257,61 @@ def create(self, *, input_dim: int, seed: int) -> object:
 | `weight_decay` | Adam 权重衰减，默认 0 |
 | `min_delta` | 计为改善所需的最小验证损失下降，默认 0 |
 
-训练设备固定为 CPU，优化器固定为 Adam，损失固定为 MSE。验证集选择最佳状态，训练完成后
+训练和本次回测推理使用所选设备，优化器固定为 Adam，损失固定为 MSE。验证集选择最佳状态，训练完成后
 在测试期逐日生成分数。
+
+### XGBoost 后端
+
+XGBoost 策略设置 `backend="xgboost"` 并使用 `XGBoostTrainingConfig`。框架固定
+`reg:squarederror`、`rmse`、`hist`，CPU 线程数固定为 1，设备由训练配置选择。验证集只用于 early stopping，
+测试/回测集不参与拟合。XGBoost 树模型不使用 StandardScaler。用户 `Model`
+只需提供 `model_id`、`model_class_name` 和 `model_parameters`，不实现 Torch `create()`。
+
+回测将 XGBoost 产物保存为 `model_bundle.ubj`；PAPER 只读加载该文件并校验
+特征顺序、`model_id`、训练截止日和 SHA-256，不自动训练或切换 bundle。
+
+### 选择 CPU 或 GPU
+
+在当前策略的 `model.py` 中修改 `MODEL_SETTINGS.training`，例如：
+
+```python
+# Torch 策略
+training=TorchTrainingConfig(device="cuda", batch_size=256)
+
+# XGBoost 策略
+training=XGBoostTrainingConfig(device="cuda", num_boost_round=500)
+```
+
+两种配置都支持 `"cpu"`、`"cuda"`、`"cuda:N"`；`"gpu"` 和 `"gpu:N"` 是 CUDA 写法的别名。
+N 从 0 开始，对应当前进程可见的 GPU 编号。省略 `device` 时使用 CPU；该选项属于各策略，
+不用修改 core 或全局设置，也不要把它放入 XGBoost 的 `Model.model_parameters`。
+
+这里的 GPU 支持使用 CUDA，需要兼容的 NVIDIA GPU、驱动和启用 CUDA 的后端安装包。
+安装了 CPU 版 PyTorch 时，仅修改配置不能启用 GPU。环境准备参考
+[PyTorch 官方安装说明](https://pytorch.org/get-started/locally/) 和
+[XGBoost GPU 文档](https://xgboost.readthedocs.io/en/stable/gpu/)。
+显式指定 GPU 后，若 CUDA 不可用或指定设备不存在，程序会报错；XGBoost 自动回退 CPU 也会被拒绝。
+
+模拟盘可以独立选择推理设备。在现有模拟盘 YAML 的 `strategy.model` 下添加 `device`：
+
+```yaml
+strategy:
+  # 保留现有 strategy_id、case、experiment_path 等其他字段。
+  model:
+    backend: "xgboost"
+    bundle_path: "private_strategy/xgboost_example/model_bundle.ubj"
+    device: "cpu"
+```
+
+Torch 同样支持这个字段，后端使用 `"torch"`，文件后缀使用 `.pt`。模拟盘省略 `device` 也默认 CPU。
+因此可以在 GPU 上训练，再在 CPU 上加载固定产物推理；训练设备仍保留在产物元数据中。
+直接调用推理加载函数时也可传 `device="cpu"` 或 `device="cuda:0"`。
+工作流的 `load(..., dataset=..., device=...)` 允许覆盖运行设备，但仍严格核对原始训练配置，
+不会因为切换推理设备而改写训练身份。
+
+GPU 加速的是模型训练和预测；行情读取、特征构建、Torch 标准化、组合分配和回测账户核算仍在 CPU。
+Torch 当前会把训练集和验证集张量整体放入所选设备；`batch_size` 控制训练批次，
+不会减少这两份输入张量本身占用的显存。CPU 与 GPU 结果也不承诺逐位一致。
 
 ## 7. TopKPortfolio
 
@@ -266,7 +333,8 @@ portfolio=TopKPortfolio(
 | `weighting` | `equal`、`score_proportional` 或 `softmax` |
 | `softmax_temperature` | 仅 Softmax 权重使用，必须大于 0 |
 
-合格证券少于 K 时只配置实际合格资产；没有合格证券时目标全部持币。
+合格证券少于 K 时只配置实际合格资产，并由框架为其他资产池证券补齐显式零权重，以便退出
+旧 Top-K 持仓。没有任何合格证券时视为模型组合不满足 Top-K 契约并终止当日决策。
 
 三种权重方式：
 
@@ -281,7 +349,7 @@ portfolio=TopKPortfolio(
 ## 8. 运行和输出
 
 在 `experiment.yaml` 中设置 `case: model`，然后通过根目录 `run_backtest.py`、Python API 或
-命令行运行该实验。除通用回测结果外，Model 运行还会保存模型 bundle、逐日预测和训练/验证/
+命令行运行该实验。除通用回测结果外，Model 运行还会保存后端对应的 bundle、逐日预测和训练/验证/
 测试指标。结果目录由 `qmt_example/configs/system.yaml` 的 `runs_dir` 控制。
 
 完整可编辑示例见 `private_strategy/beginner_example/model.py`。

@@ -1,0 +1,38 @@
+{
+  "cash": "119177.761",
+  "market_value": "1072882.500",
+  "positions": [
+    {
+      "available_quantity": 0,
+      "market_value": "0",
+      "portfolio_weight": "0E+3",
+      "raw_close": "4.02200000",
+      "symbol": "SH.510300",
+      "today_buy_quantity": 0,
+      "total_quantity": 0,
+      "turnover_rule": "T1"
+    },
+    {
+      "available_quantity": 90500,
+      "market_value": "536484.000",
+      "portfolio_weight": "0.4500477178477137407066034223",
+      "raw_close": "5.92800000",
+      "symbol": "SH.518880",
+      "today_buy_quantity": 0,
+      "total_quantity": 90500,
+      "turnover_rule": "T0"
+    },
+    {
+      "available_quantity": 504700,
+      "market_value": "536398.500",
+      "portfolio_weight": "0.4499759932857958092774640359",
+      "raw_close": "1.04500000",
+      "symbol": "SH.588000",
+      "today_buy_quantity": 8600,
+      "total_quantity": 513300,
+      "turnover_rule": "T1"
+    }
+  ],
+  "total_asset": "1192060.261",
+  "trade_date": "2024-12-31"
+}

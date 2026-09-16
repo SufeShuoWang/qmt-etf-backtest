@@ -1,116 +1,53 @@
-"""Pure daily D-close signal to D+1-close execution engine."""
+"""从 D 日收盘信号到 D+1 日收盘执行的纯日频引擎。"""
 
 from __future__ import annotations
 
+
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 from itertools import pairwise
 from types import MappingProxyType
-from typing import Protocol
+from typing import TYPE_CHECKING
 
+from etf_backtest.validation import plain_date as _plain_date
+from etf_backtest.application.contracts import DecisionStatus
+from etf_backtest.application.daily_decision import evaluate_daily_decision
 from etf_backtest.config.schema import normalize_symbol
 from etf_backtest.core.account import Account, DailySnapshot
 from etf_backtest.core.fill import FillModel
 from etf_backtest.core.market import (
     EtfInfo,
     EtfTradingRule,
-    IndexBarView,
-    MarketBarView,
     MarketFrame,
     PriceLimitSource,
 )
 from etf_backtest.core.order import (
-    ExecutionEstimate,
     FillResult,
     Order,
     RuleCheckResult,
-    TradePriceQuote,
 )
 from etf_backtest.core.order_generator import OrderGenerator
 from etf_backtest.core.pricing import TradePriceQuoteCache
 from etf_backtest.core.rule_resolver import RuleResolver
-from etf_backtest.core.target import NoRebalance, TargetPortfolio
+from etf_backtest.core.target import TargetPortfolio
 from etf_backtest.strategy.base import BaseStrategy
-from etf_backtest.strategy.context import AccountView, StrategyContext
+from etf_backtest.strategy.context import AccountView
+
+if TYPE_CHECKING:
+    from etf_backtest.core.etf_rules import EtfRuleEngine
+    from etf_backtest.data.portal import DailyDataPortal
 
 
-def _plain_date(value: object, field_name: str) -> date:
-    if isinstance(value, datetime) or not isinstance(value, date):
-        raise TypeError(f"{field_name} must be datetime.date")
-    return value
-
-
-class DailyPortal(Protocol):
-    @property
-    def symbols(self) -> tuple[str, ...]: ...
-
-    @property
-    def etf_infos(self) -> tuple[EtfInfo, ...]: ...
-
-    @property
-    def trading_calendar(self) -> object: ...
-
-    def execution_frames(self, start_date: date, end_date: date) -> tuple[MarketFrame, ...]: ...
-
-    def views_through(
-        self,
-        as_of_date: date,
-        *,
-        symbols: Sequence[str] | None = None,
-        lookback_trading_days: int | None = None,
-    ) -> tuple[MarketBarView, ...]: ...
-
-    def share_history_through(
-        self,
-        as_of_date: date,
-        *,
-        symbols: Sequence[str] | None = None,
-    ) -> Mapping[str, Mapping[date, Decimal]]: ...
-
-    def huijin_ratios_as_of(
-        self,
-        as_of_date: date,
-        *,
-        symbols: Sequence[str] | None = None,
-    ) -> Mapping[str, Mapping[str, tuple[date, Decimal]]]: ...
-
-    def index_history_through(
-        self,
-        as_of_date: date,
-        *,
-        lookback_trading_days: int | None = None,
-    ) -> Mapping[str, tuple[IndexBarView, ...]]: ...
-
-    def combined_huijin_ratios_as_of(
-        self,
-        as_of_date: date,
-        *,
-        symbols: Sequence[str] | None = None,
-    ) -> Mapping[str, tuple[date, Decimal]]: ...
-
-
-class QuantityRuleEngine(Protocol):
-    def approve_batch(
-        self,
-        *,
-        frame: MarketFrame,
-        orders: Sequence[Order],
-        quotes: Mapping[str, TradePriceQuote],
-        estimates: Mapping[str, ExecutionEstimate],
-        account: Account,
-        trading_rules: Mapping[str, EtfTradingRule],
-        etf_infos: Mapping[str, EtfInfo],
-    ) -> Sequence[RuleCheckResult]: ...
-
-
+# 记录信号日期、执行日期和目标组合，供逐日引擎暂存下一交易日要执行的目标。
 @dataclass(frozen=True, slots=True)
-class TargetDecision:
+class TargetDecision:  # 目标决策
     signal_date: date
     execution_date: date
     target_portfolio: TargetPortfolio
 
+    # 要求执行日期严格晚于信号日期，且目标为 TargetPortfolio。
     def __post_init__(self) -> None:
         signal = _plain_date(self.signal_date, "signal_date")
         execution = _plain_date(self.execution_date, "execution_date")
@@ -120,38 +57,40 @@ class TargetDecision:
             raise TypeError("target_portfolio must be TargetPortfolio")
 
 
+# 汇总一次回测的证券信息、每日账户快照、目标决策、订单、审批和成交。
 @dataclass(frozen=True, slots=True)
 class BacktestResult:
-    etf_infos: tuple[EtfInfo, ...]
-    daily_snapshots: tuple[DailySnapshot, ...]
-    orders: tuple[Order, ...]
-    fills: tuple[FillResult, ...]
-    decisions: tuple[TargetDecision, ...]
-    approvals: tuple[RuleCheckResult, ...]
+    etf_infos: tuple[EtfInfo, ...]  # etf信息
+    daily_snapshots: tuple[DailySnapshot, ...]  # 每日账户快照
+    orders: tuple[Order, ...]  # 每日生成的订单
+    fills: tuple[FillResult, ...]  # 每日成交结果
+    decisions: tuple[TargetDecision, ...]  # 每日生成的目标组合
+    approvals: tuple[RuleCheckResult, ...]  # 每日订单审批结果
 
 
 class BacktestEngine:
-    """Advance complete SSE daily frames in the one permitted event order."""
+    """按唯一允许的事件顺序推进完整上交所日频行情帧。"""
 
-    __slots__ = (
+    __slots__ = (  # BacktestEngine 实例可以拥有的属性
         "_account",
         "_etf_infos",
         "_fill_model",
         "_order_generator",
         "_portal",
         "_rule_engine",
-        "_rule_resolver",
+        "_rule_resolver",  # 每日规则解析服务
         "_strategy",
     )
 
+    # 组装数据入口、账户、策略、规则解析器、订单生成器和成交模型，供 run() 推进日期。
     def __init__(
         self,
         *,
-        portal: DailyPortal,
+        portal: DailyDataPortal,
         account: Account,
         strategy: BaseStrategy,
         rule_resolver: RuleResolver,
-        rule_engine: QuantityRuleEngine,
+        rule_engine: EtfRuleEngine,
         order_generator: OrderGenerator,
         fill_model: FillModel,
     ) -> None:
@@ -200,10 +139,12 @@ class BacktestEngine:
         self._fill_model = fill_model
         self._etf_infos = MappingProxyType(dict(sorted(infos.items())))
 
+    # 返回引擎持有的账户，便于读取运行后的现金与持仓。
     @property
     def account(self) -> Account:
         return self._account
 
+    # 回测主循环：每日先释放 T+1 持仓并执行前一日目标，再记录净值、计算下一交易日目标；最后一帧不新建目标。
     def run(
         self,
         *,
@@ -227,13 +168,13 @@ class BacktestEngine:
         approvals: list[RuleCheckResult] = []
 
         for frame_index, frame in enumerate(frames):
-            # 1. The date transition releases T+1 inventory before any order.
-            self._account.on_new_trade_date()
+            # 1. 日期切换时先释放 T+1 持仓，再处理任何订单。
+            self._account.on_new_trade_date()  # 更新下一天账户的信息
 
-            # Rules are resolved afresh for this symbol/date; no static map is
-            # allowed to leak across an effective-date boundary.
+            # 每个证券和日期都重新解析规则，禁止静态映射跨越规则生效日边界。
             trading_rules = self._resolve_rules(frame)
             raw_closes = {symbol: bar.close for symbol, bar in frame.bars_by_symbol.items()}
+            # 2. 上一交易日生成的目标只在绑定的相邻 D+1 收盘行情帧执行。
             if pending is not None:
                 if pending.execution_date != frame.trade_date:
                     raise RuntimeError("pending target did not reach its bound D+1 frame")
@@ -248,17 +189,15 @@ class BacktestEngine:
                 approvals.extend(frame_approvals)
                 pending = None
 
-            # 3. NAV is recorded only after formal fills at the same raw close.
+            # 3. 当日正式成交完成后，才按同一原始收盘价记录 NAV。
             daily = DailySnapshot(
                 trade_date=frame.trade_date,
                 account_snapshot=self._account.snapshot(raw_closes),
             )
             daily_values.append(daily)
 
-            # 4. The final frame never creates a dangling target.
+            # 4. 最后一个行情帧不再创建无法执行的悬空目标。
             if frame_index == len(frames) - 1:
-                continue
-            if not self._strategy.should_generate_target(frame_index):
                 continue
             next_frame = frames[frame_index + 1]
             account_view = AccountView.from_account(self._account)
@@ -272,46 +211,23 @@ class BacktestEngine:
                 )
                 for symbol in self._account.positions
             }
-            context = StrategyContext(
+            decision_result = evaluate_daily_decision(
+                strategy=self._strategy,
+                portal=self._portal,
                 signal_date=frame.trade_date,
                 execution_date=next_frame.trade_date,
-                frame_index=frame_index,
+                schedule_index=frame_index,
                 symbols=tuple(self._account.positions),
                 account_view=account_view,
                 current_weights_by_symbol=current_weights,
-                share_history_by_symbol=self._portal.share_history_through(
-                    frame.trade_date,
-                    symbols=tuple(self._account.positions),
-                ),
-                huijin_ratios_by_symbol=self._portal.huijin_ratios_as_of(
-                    frame.trade_date,
-                    symbols=tuple(self._account.positions),
-                ),
-                index_history_by_code=self._portal.index_history_through(
-                    frame.trade_date,
-                    lookback_trading_days=self._strategy.required_history_trading_days,
-                ),
-                combined_huijin_ratio_by_symbol=self._portal.combined_huijin_ratios_as_of(
-                    frame.trade_date,
-                    symbols=tuple(self._account.positions),
-                ),
             )
-            history = self._portal.views_through(
-                frame.trade_date,
-                symbols=tuple(self._account.positions),
-                lookback_trading_days=self._strategy.required_history_trading_days,
-            )
-            target = self._strategy.generate_target(
-                signal_date=frame.trade_date,
-                market_history=history,
-                account_view=account_view,
-                context=context,
-            )
-            if isinstance(target, NoRebalance):
+            if decision_result.status is not DecisionStatus.TARGET_CREATED:
                 continue
+            target = decision_result.target_portfolio
+            assert target is not None
             pending = TargetDecision(
-                signal_date=frame.trade_date,
-                execution_date=next_frame.trade_date,
+                signal_date=decision_result.signal_date,
+                execution_date=decision_result.execution_date,
                 target_portfolio=target,
             )
             decisions.append(pending)
@@ -325,6 +241,7 @@ class BacktestEngine:
             approvals=tuple(approvals),
         )
 
+    # 按执行日原始收盘价估值并生成订单，统一估计成交价、审批后把成交计入账户；未成交部分不自动顺延。
     def _execute_pending(
         self,
         *,
@@ -384,7 +301,7 @@ class BacktestEngine:
             )
             for order in orders
         )
-        by_order = self._validate_approvals(orders=orders, approvals=evidenced_approvals)
+        by_order = {approval.order_id: approval for approval in evidenced_approvals}
         fills: list[FillResult] = []
         for order in orders:
             fill = self._fill_model.create_fill(
@@ -398,6 +315,7 @@ class BacktestEngine:
                 fills.append(fill)
         return tuple(fills), evidenced_approvals, orders
 
+    # 为当前行情帧中的证券解析当日生效交易规则。
     def _resolve_rules(self, frame: MarketFrame) -> Mapping[str, EtfTradingRule]:
         resolved: dict[str, EtfTradingRule] = {}
         for symbol in frame.canonical_symbols:
@@ -410,6 +328,7 @@ class BacktestEngine:
             resolved[symbol] = rule
         return MappingProxyType(resolved)
 
+    # 检查执行帧日期、证券及相邻关系，确保逐日推进对应完整且有序的日历。
     def _validate_frame_sequence(self, frames: tuple[MarketFrame, ...]) -> None:
         if any(not isinstance(frame, MarketFrame) for frame in frames):
             raise TypeError("portal returned a non-MarketFrame value")
@@ -423,6 +342,7 @@ class BacktestEngine:
             if next_trading_day(left.trade_date) != right.trade_date:
                 raise ValueError("execution frames must be adjacent SSE trading dates")
 
+    # 检查审批结果与输入订单一一对应，防止错单或数量不一致进入成交。
     @staticmethod
     def _validate_approvals(
         *,
@@ -441,7 +361,5 @@ class BacktestEngine:
 __all__ = [
     "BacktestEngine",
     "BacktestResult",
-    "DailyPortal",
-    "QuantityRuleEngine",
     "TargetDecision",
 ]

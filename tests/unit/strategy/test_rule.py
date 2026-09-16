@@ -1,4 +1,4 @@
-"""Unit tests for the beginner-facing Rule adapter."""
+"""面向初学者的 Rule 适配器单元测试。"""
 
 from __future__ import annotations
 
@@ -133,6 +133,24 @@ def test_rule_can_explicitly_decline_to_create_a_rebalance_target() -> None:
 
     history, account_view, context = _inputs()
     result = SimpleRuleStrategy(rule=_NoRebalanceRule()).generate_target(
+        signal_date=SIGNAL_DATE,
+        market_history=history,
+        account_view=account_view,
+        context=context,
+    )
+
+    assert result is NO_REBALANCE
+
+
+@pytest.mark.unit
+def test_empty_rule_mapping_is_normalized_to_no_rebalance() -> None:
+    class _EmptyRule(UserRule):
+        def generate_weights(self, data: RuleMarketData) -> Mapping[str, WeightInput]:
+            del data
+            return {}
+
+    history, account_view, context = _inputs()
+    result = SimpleRuleStrategy(rule=_EmptyRule()).generate_target(
         signal_date=SIGNAL_DATE,
         market_history=history,
         account_view=account_view,

@@ -1,4 +1,4 @@
-"""Daily-close ETF quantity approval tests."""
+"""日频收盘 ETF 数量审批测试。"""
 
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ from etf_backtest.core.market import (
 )
 from etf_backtest.core.order import Order, OrderSide, RuleCheckResult, RuleReasonCode
 from etf_backtest.core.position import Position
-from etf_backtest.core.pricing import CloseTradePriceModel
-from etf_backtest.core.slippage import SlippageModel
+from etf_backtest.core.pricing import TradePriceQuoteCache
+from etf_backtest.core.fill import SlippageModel
 
 TRADE_DATE = date(2025, 1, 3)
 SIGNAL_DATE = date(2025, 1, 2)
@@ -165,15 +165,8 @@ def _approve(
     volume_rate: Decimal = Decimal("0.20"),
 ) -> list[RuleCheckResult]:
     rules = {symbol: _rule(symbol) for symbol in frame.canonical_symbols}
-    price_model = CloseTradePriceModel()
     fill_model = _fill_model()
-    quotes = {
-        symbol: price_model.resolve(
-            execution_bar=frame.bar_for(symbol),
-            trading_rule=rules[symbol],
-        )
-        for symbol in frame.canonical_symbols
-    }
+    quotes = TradePriceQuoteCache(frame=frame, trading_rules=rules).resolve_all(frame.canonical_symbols)
     estimates = {
         order.order_id: fill_model.create_estimate(
             order=order,
@@ -324,7 +317,7 @@ def test_daily_price_limits_are_directional(side: OrderSide, close: Decimal) -> 
 
 @pytest.mark.unit
 def test_explicit_limit_price_drives_directional_block_and_quote_validation() -> None:
-    # The explicit upper limit intentionally differs from the 10% fallback (11.000).
+    # 显式涨停价有意不同于 10% 回退值（11.000）。
     explicit_bar = replace(
         _bar(STOCK, close=Decimal("10.500")),
         price_limit_down=Decimal("9.000"),
@@ -389,10 +382,7 @@ def test_execution_date_and_quote_chain_mismatches_are_rejected() -> None:
 
     order = _order("bad-chain", STOCK, OrderSide.BUY, 100)
     rule = _rule(STOCK)
-    quote = CloseTradePriceModel().resolve(
-        execution_bar=frame.bar_for(STOCK),
-        trading_rule=rule,
-    )
+    quote = TradePriceQuoteCache(frame=frame, trading_rules={STOCK: rule}).quote_for(STOCK)
     bad_quote = replace(
         quote,
         source_record_key=f"QMT:510300:{TRADE_DATE.isoformat()}:9:9",
@@ -425,10 +415,7 @@ def test_constructor_and_batch_boundaries_reject_invalid_inputs() -> None:
     frame = _frame(_bar(STOCK))
     order = _order("duplicate", STOCK, OrderSide.BUY, 100)
     rule = _rule(STOCK)
-    quote = CloseTradePriceModel().resolve(
-        execution_bar=frame.bar_for(STOCK),
-        trading_rule=rule,
-    )
+    quote = TradePriceQuoteCache(frame=frame, trading_rules={STOCK: rule}).quote_for(STOCK)
     estimate = fill_model.create_estimate(order=order, quote=quote, tick_size=rule.tick_size)
     with pytest.raises(ValueError, match="unique"):
         EtfRuleEngine(fill_model=fill_model).approve_batch(

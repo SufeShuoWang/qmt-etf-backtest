@@ -1,4 +1,4 @@
-"""QMT daily repository business-key, status, mapping, and preflight tests."""
+"""QMT 日频仓储的业务键、状态、映射和预检测试。"""
 
 from __future__ import annotations
 

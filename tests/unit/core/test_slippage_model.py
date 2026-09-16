@@ -1,4 +1,4 @@
-"""Fixed proportional close-price slippage tests."""
+"""固定比例收盘价滑点测试。"""
 
 from decimal import Decimal
 from inspect import signature
@@ -7,7 +7,7 @@ import pytest
 
 from etf_backtest.config.schema import SlippageConfig
 from etf_backtest.core.order import OrderSide
-from etf_backtest.core.slippage import SlippageModel
+from etf_backtest.core.fill import SlippageModel
 
 
 @pytest.mark.unit

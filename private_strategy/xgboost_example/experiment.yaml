@@ -1,0 +1,8 @@
+name: xgboost_example
+start_date: 2024-01-01
+end_date: 2024-12-31
+initial_cash: "1000000"
+case: model
+universe:
+  symbols: [SH.510300, SH.518880, SH.588000]
+  pools: []

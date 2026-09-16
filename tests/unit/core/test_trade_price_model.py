@@ -1,4 +1,4 @@
-"""Raw-close price and effective legal-limit tests."""
+"""原始收盘价和有效法定价格边界测试。"""
 
 from dataclasses import replace
 from datetime import date
@@ -15,7 +15,7 @@ from etf_backtest.core.market import (
     PriceLimitSource,
     TurnoverRule,
 )
-from etf_backtest.core.pricing import CloseTradePriceModel, TradePriceQuoteCache
+from etf_backtest.core.pricing import TradePriceQuoteCache
 
 
 def _bar() -> MarketBar:
@@ -43,9 +43,16 @@ def _rule() -> EtfTradingRule:
     )
 
 
+def _cache(bar, rule):
+    return TradePriceQuoteCache(
+        frame=MarketFrame.from_bars(FrameKey(trade_date=bar.trade_date, calendar_version="test"), (bar,)),
+        trading_rules={bar.symbol: rule},
+    )
+
+
 @pytest.mark.unit
 def test_close_model_uses_raw_close_and_tick_rounded_legal_limits() -> None:
-    quote = CloseTradePriceModel().resolve(execution_bar=_bar(), trading_rule=_rule())
+    quote = _cache(_bar(), _rule()).quote_for(_bar().symbol)
 
     assert quote.base_trade_price == Decimal("10.100")
     assert quote.price_limit_down == Decimal("9.005")
@@ -64,20 +71,11 @@ def test_close_model_prefers_explicit_daily_price_limits() -> None:
         price_limit_source=PriceLimitSource.TUSHARE_EXPLICIT,
     )
 
-    quote = CloseTradePriceModel().resolve(execution_bar=bar, trading_rule=_rule())
+    quote = _cache(bar, _rule()).quote_for(bar.symbol)
 
     assert quote.price_limit_down == Decimal("9.000")
     assert quote.price_limit_up == Decimal("10.500")
     assert quote.price_limit_source is PriceLimitSource.TUSHARE_EXPLICIT
-
-
-class _SpyCloseModel(CloseTradePriceModel):
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def resolve(self, *, execution_bar: MarketBar, trading_rule: EtfTradingRule):
-        self.calls += 1
-        return super().resolve(execution_bar=execution_bar, trading_rule=trading_rule)
 
 
 @pytest.mark.unit
@@ -87,18 +85,15 @@ def test_quote_cache_resolves_a_frame_symbol_once() -> None:
         FrameKey(trade_date=bar.trade_date, calendar_version="qmt-v1"),
         (bar,),
     )
-    model = _SpyCloseModel()
     cache = TradePriceQuoteCache(
         frame=frame,
         trading_rules={bar.symbol: _rule()},
-        model=model,
     )
 
     first = cache.quote_for("510300")
     second = cache.quote_for("SH.510300")
 
     assert first is second
-    assert model.calls == 1
 
 
 @pytest.mark.unit
@@ -109,5 +104,5 @@ def test_rule_identity_must_match_bar() -> None:
         turnover_rule=TurnoverRule.T0,
         price_limit_ratio=Decimal("0.10"),
     )
-    with pytest.raises(ValueError, match="symbol"):
-        CloseTradePriceModel().resolve(execution_bar=_bar(), trading_rule=wrong)
+    with pytest.raises(ValueError, match="key mismatch"):
+        _cache(_bar(), wrong)

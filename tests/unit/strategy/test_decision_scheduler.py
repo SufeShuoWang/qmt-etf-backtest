@@ -1,4 +1,4 @@
-"""Trading-frame schedule tests."""
+"""交易行情帧调度测试。"""
 
 import pytest
 

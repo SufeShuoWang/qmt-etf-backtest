@@ -1,9 +1,7 @@
-"""Strict, secret-free user experiment configuration.
+"""严格且不含密码的用户实验配置。
 
-The public experiment document intentionally contains only choices owned by a
-strategy author.  Database credentials, snapshot identity, and effective rule
-resources live in :class:`SystemSettings` and are merged only when a concrete
-``BacktestConfig`` is built.
+公开实验文档只包含策略作者负责的选项。数据库凭据、快照身份和有效规则资源保存在
+:class:`SystemSettings` 中，仅在构建具体 ``BacktestConfig`` 时合并。
 """
 
 from __future__ import annotations
@@ -43,17 +41,19 @@ _FORBIDDEN_NAME_CHARACTERS = frozenset('<>:"/\\|?*')
 
 
 class _StrictExperimentModel(BaseModel):
-    """Immutable, typo-rejecting base shared by experiment documents."""
+    """实验文档共用的不可变、拒绝未知字段配置基类。"""
 
     model_config = ConfigDict(frozen=True, extra="forbid", validate_default=True)
 
 
+# 拒绝资金和比例的浮点输入，避免配置阶段引入二进制精度误差。
 def _reject_float(value: object, field_name: str) -> object:
     if isinstance(value, float):
         raise TypeError(f"{field_name} must be supplied as decimal text")
     return value
 
 
+# 检查名称可作为单个 Windows 路径组件，拒绝非法字符和保留名。
 def _safe_component(value: object, field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string")
@@ -79,7 +79,7 @@ def safe_relative_path(
     *,
     suffix: str | None = None,
 ) -> Path:
-    """Return a normalized project-relative path that cannot escape its root."""
+    """返回规范化且不能越出项目根目录的相对路径。"""
 
     if not isinstance(value, str | Path):
         raise TypeError(f"{field_name} must be a path string")
@@ -99,7 +99,7 @@ def safe_relative_path(
 
 
 class SystemSettings(_StrictExperimentModel):
-    """Operator-owned data, execution defaults, output root and rule resources."""
+    """由维护者管理的数据、执行默认值、输出根目录和规则资源。"""
 
     database: DatabaseConfig
     data_snapshot: DataSnapshotConfig = Field(default_factory=DataSnapshotConfig)
@@ -111,26 +111,31 @@ class SystemSettings(_StrictExperimentModel):
     volume_participation_rate: Decimal = Decimal("0.20")
     runs_dir: Path = Path("runs")
 
+    # 校验规则 CSV 为项目内安全相对路径且扩展名正确。
     @field_validator("limit_rules_csv", mode="before")
     @classmethod
     def _rule_csv_path(cls, value: object) -> Path:
         return safe_relative_path(value, "limit_rules_csv", suffix=".csv")
 
+    # 校验规则清单为项目内安全 JSON 相对路径。
     @field_validator("limit_rules_manifest", mode="before")
     @classmethod
     def _rule_manifest_path(cls, value: object) -> Path:
         return safe_relative_path(value, "limit_rules_manifest", suffix=".json")
 
+    # 在转换前拒绝浮点成交量参与比例。
     @field_validator("volume_participation_rate", mode="before")
     @classmethod
     def _volume_rate(cls, value: object) -> object:
         return _reject_float(value, "volume_participation_rate")
 
+    # 校验结果根目录为安全的项目相对路径。
     @field_validator("runs_dir", mode="before")
     @classmethod
     def _runs_path(cls, value: object) -> Path:
         return safe_relative_path(value, "runs_dir")
 
+    # 检查系统配置中的成交量参与比例位于 (0, 1]。
     @model_validator(mode="after")
     def _valid_execution_defaults(self) -> Self:
         if not self.volume_participation_rate.is_finite() or not Decimal(
@@ -141,7 +146,7 @@ class SystemSettings(_StrictExperimentModel):
 
     @classmethod
     def from_backtest_config(cls, config: BacktestConfig) -> Self:
-        """Project system-owned values from an already validated run config."""
+        """从已校验的运行配置提取项目系统维护的值。"""
 
         if not isinstance(config, BacktestConfig):
             raise TypeError("config must be BacktestConfig")
@@ -159,7 +164,7 @@ class SystemSettings(_StrictExperimentModel):
 
 
 class UserExperimentConfig(_StrictExperimentModel):
-    """Common experiment inputs; all strategy-specific settings live in Python."""
+    """实验共用输入；所有策略专属设置均在 Python 中维护。"""
 
     name: str
     start_date: date
@@ -168,17 +173,20 @@ class UserExperimentConfig(_StrictExperimentModel):
     universe: UniverseConfig
     case: Literal["rule", "model"]
 
+    # 校验实验名称非空且可以安全用于文件与结果标识。
     @field_validator("name", mode="before")
     @classmethod
     def _experiment_name(cls, value: object) -> str:
         return _safe_component(value, "name")
 
+    # 在类型转换前检查初始资金输入格式。
     @field_validator("initial_cash", mode="before")
     @classmethod
     def _decimal_core_values(cls, value: object, info: object) -> object:
         field_name = getattr(info, "field_name", "Decimal")
         return _reject_float(value, field_name)
 
+    # 检查实验日期顺序与初始资金正值约束。
     @model_validator(mode="after")
     def _valid_experiment(self) -> Self:
         if self.start_date > self.end_date:
@@ -193,7 +201,7 @@ class UserExperimentConfig(_StrictExperimentModel):
         *,
         strategy: RuleStrategyConfig | ModelStrategyConfig,
     ) -> BacktestConfig:
-        """Merge code-resolved strategy settings with common and system inputs."""
+        """合并代码解析的策略设置、实验共用输入和系统输入。"""
 
         if not isinstance(system, SystemSettings):
             raise TypeError("system must be SystemSettings")
@@ -220,7 +228,7 @@ class UserExperimentConfig(_StrictExperimentModel):
 
 
 def load_user_experiment_config(path: Path) -> UserExperimentConfig:
-    """Load one UTF-8 user YAML document without system-setting translation."""
+    """加载单个 UTF-8 用户 YAML 文档，不转换系统设置。"""
 
     source = Path(path)
     payload = yaml.safe_load(source.read_text(encoding="utf-8"))
@@ -229,8 +237,9 @@ def load_user_experiment_config(path: Path) -> UserExperimentConfig:
     return UserExperimentConfig.model_validate(payload)
 
 
+# 读取系统 YAML 的同时校验路径、数据库与执行参数，返回 SystemSettings；不在此执行交易或连接券商。
 def load_system_settings(path: Path) -> SystemSettings:
-    """Load one UTF-8 operator-owned system settings YAML document."""
+    """加载单个 UTF-8 系统维护者设置 YAML 文档。"""
 
     source = Path(path)
     payload = yaml.safe_load(source.read_text(encoding="utf-8"))

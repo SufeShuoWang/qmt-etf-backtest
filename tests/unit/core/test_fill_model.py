@@ -1,4 +1,4 @@
-"""Estimate and formal-fill tests for the daily-close chain."""
+"""日频收盘链路的估算和正式成交测试。"""
 
 from datetime import date
 from decimal import Decimal
@@ -16,7 +16,7 @@ from etf_backtest.core.order import (
     RuleReasonCode,
     TradePriceQuote,
 )
-from etf_backtest.core.slippage import SlippageModel
+from etf_backtest.core.fill import SlippageModel
 
 
 def _model() -> FillModel:

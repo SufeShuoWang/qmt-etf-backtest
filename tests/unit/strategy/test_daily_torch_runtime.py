@@ -1,4 +1,4 @@
-"""PyTorch fit-once, early-stopping, and state_dict bundle tests."""
+"""PyTorch 单次拟合、early stopping 和 state_dict bundle 测试。"""
 
 from __future__ import annotations
 
@@ -45,14 +45,18 @@ class _OneFeatureBuilder:
         return (history[-1].close,)
 
 
-class _LinearFactory:
-    model_id = "tests.linear"
-    model_class_name = "Linear"
-    model_parameters: Mapping[str, object] = {"bias": True}
+class _TinyMlpFactory:
+    model_id = "tests.mlp"
+    model_class_name = "TinyMLP"
+    model_parameters: Mapping[str, object] = {"hidden_dim": 4}
 
     def create(self, *, input_dim: int, seed: int) -> object:
         del seed
-        return torch.nn.Linear(input_dim, 1, bias=True)
+        return torch.nn.Sequential(
+            torch.nn.Linear(input_dim, 4),
+            torch.nn.ReLU(),
+            torch.nn.Linear(4, 1),
+        )
 
 
 def _records(start: date, values: tuple[int, ...]) -> tuple[LabeledRecord, ...]:
@@ -104,7 +108,7 @@ def _training() -> TorchTrainingConfig:
 def _workflow(identity: ModelDataIdentity | None = None) -> DailyTorchWorkflow:
     return DailyTorchWorkflow(
         feature_builder=_OneFeatureBuilder(),
-        model_factory=_LinearFactory(),
+        model_factory=_TinyMlpFactory(),
         data_identity=_identity() if identity is None else identity,
         training_config=_training(),
     )

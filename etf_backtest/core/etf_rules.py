@@ -1,18 +1,18 @@
-"""Pure daily-close ETF order approval.
+"""纯日频收盘 ETF 订单审批。
 
-The rule engine owns the one final approved quantity for every order.  It
-simulates cash, sellable holdings, and daily volume consumption without
-mutating the account; only a later formal fill may change economic state.
+规则引擎唯一负责确定每笔订单的最终批准数量。它在不修改账户的情况下模拟现金、可卖持仓
+和当日成交量占用；只有后续正式成交才能改变经济状态。
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
-from typing import Final, Protocol, runtime_checkable
+from typing import Final
 
 from etf_backtest.config.schema import normalize_symbol
 from etf_backtest.core.account import Account
+from etf_backtest.core.fill import FillModel
 from etf_backtest.core.market import (
     EtfInfo,
     EtfTradingRule,
@@ -33,38 +33,7 @@ _ZERO: Final = Decimal("0")
 _DEFAULT_VOLUME_PARTICIPATION_RATE: Final = Decimal("0.20")
 
 
-class _ExecutionCost(Protocol):
-    @property
-    def trade_amount(self) -> Decimal: ...
-
-    @property
-    def fee(self) -> Decimal: ...
-
-    @property
-    def total_cash_required(self) -> Decimal: ...
-
-
-@runtime_checkable
-class _FillCostModel(Protocol):
-    def estimate_cost(
-        self,
-        *,
-        order: Order,
-        estimate: ExecutionEstimate,
-        quantity: int,
-    ) -> _ExecutionCost: ...
-
-    def max_affordable_buy_quantity(
-        self,
-        *,
-        order: Order,
-        estimate: ExecutionEstimate,
-        available_cash: Decimal,
-        lot_size: int,
-        upper_quantity: int | None = None,
-    ) -> int: ...
-
-
+# 构造通过审批的订单检查结果，保存批准数量及原因信息。
 def _approved_result(
     order: Order,
     approved_quantity: int,
@@ -85,6 +54,7 @@ def _approved_result(
     )
 
 
+# 构造拒绝订单的检查结果，记录规则原因而不修改账户。
 def _rejected_result(
     order: Order,
     reason_code: RuleReasonCode,
@@ -102,6 +72,7 @@ def _rejected_result(
     )
 
 
+# 校验并索引订单使用的原始交易报价。
 def _normalize_quotes(values: Mapping[str, TradePriceQuote]) -> dict[str, TradePriceQuote]:
     if not isinstance(values, Mapping):
         raise TypeError("quotes must be a mapping")
@@ -118,6 +89,7 @@ def _normalize_quotes(values: Mapping[str, TradePriceQuote]) -> dict[str, TradeP
     return normalized
 
 
+# 校验证券到当日交易规则的映射。
 def _normalize_rules(values: Mapping[str, EtfTradingRule]) -> dict[str, EtfTradingRule]:
     if not isinstance(values, Mapping):
         raise TypeError("trading_rules must be a mapping")
@@ -134,6 +106,7 @@ def _normalize_rules(values: Mapping[str, EtfTradingRule]) -> dict[str, EtfTradi
     return normalized
 
 
+# 校验证券主信息映射，供上市／退市状态检查使用。
 def _normalize_infos(values: Mapping[str, EtfInfo]) -> dict[str, EtfInfo]:
     if not isinstance(values, Mapping):
         raise TypeError("etf_infos must be a mapping")
@@ -150,6 +123,7 @@ def _normalize_infos(values: Mapping[str, EtfInfo]) -> dict[str, EtfInfo]:
     return normalized
 
 
+# 校验并索引预先计算的成交估计，保证审批与成交使用同一价格。
 def _normalize_estimates(
     values: Mapping[str, ExecutionEstimate],
 ) -> dict[str, ExecutionEstimate]:
@@ -168,18 +142,19 @@ def _normalize_estimates(
 
 
 class EtfRuleEngine:
-    """Approve daily-close orders in deterministic SELL-then-BUY order."""
+    """按先 SELL 后 BUY 的确定性顺序审批日频收盘订单。"""
 
     __slots__ = ("_fill_model", "_volume_participation_rate")
 
+    # 校验并保存单日成交量参与比例上限。
     def __init__(
         self,
         *,
-        fill_model: _FillCostModel,
+        fill_model: FillModel,
         volume_participation_rate: Decimal = _DEFAULT_VOLUME_PARTICIPATION_RATE,
     ) -> None:
-        if not isinstance(fill_model, _FillCostModel):
-            raise TypeError("fill_model must provide execution-cost and affordability methods")
+        if not isinstance(fill_model, FillModel):
+            raise TypeError("fill_model must be FillModel")
         if not isinstance(volume_participation_rate, Decimal):
             raise TypeError("volume_participation_rate must be Decimal")
         if (
@@ -191,10 +166,12 @@ class EtfRuleEngine:
         self._fill_model = fill_model
         self._volume_participation_rate = volume_participation_rate
 
+    # 返回本规则引擎配置的成交量参与比例。
     @property
     def volume_participation_rate(self) -> Decimal:
         return self._volume_participation_rate
 
+    # 批量审批先卖后买；用预计现金、可卖量和已占用成交量决定各订单批准数量，审批本身不修改正式账户。
     def approve_batch(
         self,
         *,
@@ -206,11 +183,10 @@ class EtfRuleEngine:
         trading_rules: Mapping[str, EtfTradingRule],
         etf_infos: Mapping[str, EtfInfo],
     ) -> list[RuleCheckResult]:
-        """Return exactly one immutable approval result per supplied order.
+        """为每笔输入订单返回唯一的不可变审批结果。
 
-        SELL orders are evaluated first so their net proceeds may fund BUY
-        orders.  Within each side, sorting makes the result independent of
-        caller input order.  BUY priority follows descending target-value gap.
+        先评估 SELL，使卖出净收入可用于后续 BUY。同一方向内通过排序消除调用方输入顺序
+        的影响，BUY 按目标市值缺口从大到小确定优先级。
         """
 
         if not isinstance(frame, MarketFrame):
@@ -396,6 +372,7 @@ class EtfRuleEngine:
 
         return results
 
+    # 执行上市状态、停牌、报价、整手等共用预检查，返回拒绝原因或允许继续检查。
     def _common_precheck(
         self,
         *,
@@ -458,7 +435,7 @@ class EtfRuleEngine:
                 RuleReasonCode.QUOTE_UNAVAILABLE,
                 "quote or execution estimate is missing or inconsistent",
             )
-        if quote is None:  # pragma: no cover - narrowed by the validation above
+        if quote is None:  # pragma: no cover - 上方校验已缩小该分支范围
             raise AssertionError("validated quote unexpectedly missing")
 
         if (order.side is OrderSide.BUY and quote.base_trade_price >= quote.price_limit_up) or (
@@ -477,6 +454,7 @@ class EtfRuleEngine:
             )
         return None
 
+    # 确认订单、行情帧、报价和成交估计属于同一执行链，避免混用日期或证券。
     @classmethod
     def _execution_chain_is_valid(
         cls,
@@ -515,6 +493,7 @@ class EtfRuleEngine:
             and direction_is_valid
         )
 
+    # 按当日成交量上限扣除已批准数量，计算还能批准的数量。
     def _volume_remaining(
         self,
         *,

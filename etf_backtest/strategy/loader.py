@@ -1,4 +1,4 @@
-"""Load the fixed ``Strategy`` class from one trusted local Rule file."""
+"""从单个可信本地 Rule 文件加载固定名称的 ``Strategy`` 类。"""
 
 from __future__ import annotations
 
@@ -11,9 +11,10 @@ from etf_backtest.strategy.rule import RuleSettings, UserRule
 
 
 class UserRuleLoadError(ValueError):
-    """A trusted local Rule file does not expose the fixed extension contract."""
+    """可信本地 Rule 文件未提供固定扩展契约。"""
 
 
+# 解析策略文件路径，要求文件存在、为 Python 文件且位于允许目录中。
 def _source_in_root(path: str | Path, allowed_root: str | Path, label: str) -> Path:
     root = Path(allowed_root).resolve(strict=True)
     if not root.is_dir():
@@ -27,6 +28,7 @@ def _source_in_root(path: str | Path, allowed_root: str | Path, label: str) -> P
     return source
 
 
+# 按文件路径执行可信本地 Python 模块，临时登记模块后清理登记；返回已创建的模块对象。
 def _load_module(source: Path, label: str) -> ModuleType:
     module_name = f"_qmt_{label.casefold()}_{source.stat().st_mtime_ns:x}"
     spec = importlib.util.spec_from_file_location(module_name, source)
@@ -46,7 +48,7 @@ def _load_module(source: Path, label: str) -> ModuleType:
 
 
 def load_user_rule(path: str | Path, *, allowed_root: str | Path) -> UserRule:
-    """Instantiate ``Strategy`` from a trusted local Python file."""
+    """从可信本地 Python 文件实例化 ``Strategy``。"""
 
     source = _source_in_root(path, allowed_root, "Rule")
     module = _load_module(source, "Rule")

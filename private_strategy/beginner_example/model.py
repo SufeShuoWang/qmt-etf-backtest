@@ -1,4 +1,3 @@
-# ruff: noqa: RUF002, RUF003
 """初学者 Model 示例：三个日频特征和一个小型 PyTorch MLP。
 
 用户可以做什么：
@@ -59,6 +58,7 @@ MODEL_SETTINGS = ModelSettings(
         weighting="score_proportional",
     ),
     training=TorchTrainingConfig(
+        device="cpu",  # 改为 "cuda" 使用 GPU，"cuda:0" 指定第一张显卡。
         seed=42,
         max_epochs=15,
         patience=4,
@@ -73,16 +73,19 @@ MODEL_SETTINGS = ModelSettings(
 class Features(FeatureBuilder):
     """定义单只证券的纯特征函数；可增加构造函数接收 feature_kwargs。"""
 
+    # 声明入门模型三个特征的名称与顺序。
     @property
     def feature_names(self) -> tuple[str, ...]:
         # 名称必须非空、唯一，且数量必须和 build_features 的返回值完全一致。
         return ("return_5d", "return_20d", "volume_ratio_5_20")
 
+    # 声明计算 20 日收益至少需要 21 个历史观察。
     @property
     def required_history_trading_days(self) -> int:
         # N 日收益需要 N+1 个收盘观察值；系统只把最后这么多条历史交给特征函数。
         return 21
 
+    # 计算 5 日收益、20 日收益和 5／20 日均量比，历史不足、窗口停牌或均量无效时跳过样本。
     def build_features(
         self,
         *,
@@ -121,25 +124,30 @@ class Features(FeatureBuilder):
 class Model(TorchModelFactory):
     """构造接收二维 [batch, input_dim] 输入并为每个样本输出一个分数的网络。"""
 
+    # 保存网络隐藏层宽度等用户参数，供训练和加载重建同一网络。
     def __init__(self, hidden_dim: int = 16) -> None:
         if type(hidden_dim) is not int or hidden_dim <= 0:
             raise ValueError("hidden_dim must be a positive integer")
         self.hidden_dim = hidden_dim
 
+    # 返回入门 Torch 模型的稳定标识。
     @property
     def model_id(self) -> str:
         # 改变网络含义或结构后应更新 ID，例如 beginner_mlp_v2。
         return "beginner_mlp"
 
+    # 返回网络工厂的类名称标识，供产物兼容性检查。
     @property
     def model_class_name(self) -> str:
         return type(self).__name__
 
+    # 返回网络构造参数，供模型元数据记录与加载校验。
     @property
     def model_parameters(self) -> Mapping[str, object]:
         # 必须完整记录重建相同网络所需的有限、JSON 兼容参数，供 bundle 做兼容性校验。
         return {"hidden_dim": self.hidden_dim}
 
+    # 按输入特征维数创建线性层、ReLU 和单输出层组成的回归网络。
     def create(self, *, input_dim: int, seed: int) -> object:
         # PyTorch 在真正训练/加载时才导入；不要在模块顶层强制导入。
         from torch import nn

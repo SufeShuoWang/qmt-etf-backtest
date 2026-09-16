@@ -1,13 +1,15 @@
-"""Daily-only boundary between raw execution frames and front strategy views."""
+"""原始执行行情帧与前复权策略视图之间的纯日频边界。"""
 
 from __future__ import annotations
 
+
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 from types import MappingProxyType
 
+from etf_backtest.validation import plain_date as _plain_date
 from etf_backtest.config.schema import normalize_symbol
 from etf_backtest.core.market import EtfInfo, IndexBarView, MarketBarView, MarketFrame
 from etf_backtest.data.calendar import SseTradingCalendar
@@ -20,23 +22,17 @@ from etf_backtest.data.mysql import (
 
 
 class DataQualityError(ValueError):
-    """A dataset violates the frozen daily portal contract."""
-
-
-def _plain_date(value: object, field_name: str) -> date:
-    if isinstance(value, datetime) or not isinstance(value, date):
-        raise TypeError(f"{field_name} must be datetime.date")
-    return value
+    """数据集违反冻结日频数据入口契约。"""
 
 
 class DailyDataPortal:
-    """Immutable raw frames plus non-leaking front-view history.
+    """不可变原始行情帧及无未来泄漏的前复权视图历史。
 
-    Execution callers can retrieve a raw frame for one SSE trading date.
-    Strategy/model callers receive front views only through an explicit
-    ``as_of_date`` boundary; there is no public all-views collection.
+    执行调用方可获取某个上交所交易日的原始行情帧；策略和模型调用方只能通过明确的
+    ``as_of_date`` 边界获取前复权视图，不提供包含全部日期的公开视图集合。
     """
 
+    # 将日数据集组织成日期／证券索引，建立策略历史与原始执行行情的分离入口。
     def __init__(self, dataset: QmtDailyDataset) -> None:
         if not isinstance(dataset, QmtDailyDataset):
             raise TypeError("dataset must be QmtDailyDataset")
@@ -147,49 +143,35 @@ class DailyDataPortal:
         self._share_by_symbol = MappingProxyType(frozen_shares)
         self._huijin_ratio_history_by_symbol = MappingProxyType(frozen_ratios)
         self._index_history_by_code = MappingProxyType(frozen_index_history)
-        self._frame_dates = tuple(sorted(frames_by_date))
 
+    # 返回行情入口使用的数据集版本。
     @property
     def dataset_version(self) -> str:
         return self._dataset_version
 
+    # 返回本次数据入口覆盖的标准证券代码。
     @property
     def symbols(self) -> tuple[str, ...]:
         return self._symbols
 
+    # 返回冻结证券的主信息，供生命周期和规则检查。
     @property
     def etf_infos(self) -> tuple[EtfInfo, ...]:
         return tuple(self._infos[symbol] for symbol in self._symbols)
 
+    # 返回数据入口对应的 SSE 交易日历。
     @property
     def trading_calendar(self) -> SseTradingCalendar:
         return self._calendar
 
-    @property
-    def frame_dates(self) -> tuple[date, ...]:
-        return self._frame_dates
 
-    @property
-    def frames(self) -> tuple[MarketFrame, ...]:
-        """Expose raw execution frames; adjusted views remain date-gated."""
-
-        return tuple(self._frames_by_date[trade_date] for trade_date in self._frame_dates)
-
+    # 取得某交易日的原始行情帧，供执行和账户估值。
     def raw_frame(self, trade_date: date) -> MarketFrame | None:
         value = self._calendar.require_trading_day(trade_date)
         return self._frames_by_date.get(value)
 
-    def current_frame(self, trade_date: date) -> MarketFrame | None:
-        """Compatibility name for the daily raw execution frame."""
 
-        return self.raw_frame(trade_date)
-
-    def next_execution_frame(self, signal_date: date) -> MarketFrame | None:
-        """Return the strict next SSE close frame; never execute on signal day."""
-
-        next_date = self._calendar.next_trading_day(signal_date)
-        return self._frames_by_date.get(next_date)
-
+    # 按信号日和可选回看窗口截取前复权历史；限制的是行的业务日期，数据快照本身仍属于回顾式快照。
     def views_through(
         self,
         as_of_date: date,
@@ -197,10 +179,9 @@ class DailyDataPortal:
         symbols: Sequence[str] | None = None,
         lookback_trading_days: int | None = None,
     ) -> tuple[MarketBarView, ...]:
-        """Return only front views whose business date is at or before ``D``."""
+        """仅返回业务日期不晚于 ``D`` 的前复权视图。"""
 
-        cutoff = _plain_date(as_of_date, "as_of_date")
-        self._calendar.day(cutoff)
+        cutoff = self._checked_cutoff(as_of_date)
         selected = self._selected_symbols(symbols)
         if lookback_trading_days is not None:
             if type(lookback_trading_days) is not int or lookback_trading_days <= 0:
@@ -220,18 +201,6 @@ class DailyDataPortal:
             if symbol in selected
         )
 
-    def strategy_history(
-        self,
-        as_of_date: date,
-        *,
-        symbols: Sequence[str] | None = None,
-        lookback_trading_days: int | None = None,
-    ) -> tuple[MarketBarView, ...]:
-        return self.views_through(
-            as_of_date,
-            symbols=symbols,
-            lookback_trading_days=lookback_trading_days,
-        )
 
     def share_history_through(
         self,
@@ -239,10 +208,9 @@ class DailyDataPortal:
         *,
         symbols: Sequence[str] | None = None,
     ) -> Mapping[str, Mapping[date, Decimal]]:
-        """Return exact daily total-share observations through signal D."""
+        """返回截至信号日 D 的精确每日总份额观察值。"""
 
-        cutoff = _plain_date(as_of_date, "as_of_date")
-        self._calendar.day(cutoff)
+        cutoff = self._checked_cutoff(as_of_date)
         selected = self._selected_symbols(symbols)
         return MappingProxyType(
             {
@@ -257,16 +225,16 @@ class DailyDataPortal:
             }
         )
 
+    # 实际按报告期 EndDate < 信号日筛选各主体最新比例；不能据此证明该报告在当时已经披露。
     def huijin_ratios_as_of(
         self,
         as_of_date: date,
         *,
         symbols: Sequence[str] | None = None,
     ) -> Mapping[str, Mapping[str, tuple[date, Decimal]]]:
-        """Return each Huijin entity's latest ratio strictly before signal D."""
+        """返回每个汇金主体严格早于信号日 D 的最新比例。"""
 
-        cutoff = _plain_date(as_of_date, "as_of_date")
-        self._calendar.day(cutoff)
+        cutoff = self._checked_cutoff(as_of_date)
         selected = self._selected_symbols(symbols)
         result: dict[str, Mapping[str, tuple[date, Decimal]]] = {}
         for symbol in sorted(selected):
@@ -279,16 +247,16 @@ class DailyDataPortal:
             result[symbol] = MappingProxyType(latest)
         return MappingProxyType(result)
 
+    # 选择信号日前最新的共同计算报告期，汇总该期各主体比例；不会把不同报告期各自最新值直接相加。
     def combined_huijin_ratios_as_of(
         self,
         as_of_date: date,
         *,
         symbols: Sequence[str] | None = None,
     ) -> Mapping[str, tuple[date, Decimal]]:
-        """Return the latest pre-D same-period sum across the two Huijin entities."""
+        """返回两个汇金主体在 D 日前最新同报告期比例之和。"""
 
-        cutoff = _plain_date(as_of_date, "as_of_date")
-        self._calendar.day(cutoff)
+        cutoff = self._checked_cutoff(as_of_date)
         selected = self._selected_symbols(symbols)
         result: dict[str, tuple[date, Decimal]] = {}
         for symbol in sorted(selected):
@@ -318,10 +286,9 @@ class DailyDataPortal:
         *,
         lookback_trading_days: int | None = None,
     ) -> Mapping[str, tuple[IndexBarView, ...]]:
-        """Return configured PRICE index bars through signal D."""
+        """返回截至信号日 D 的已配置 PRICE 指数行情。"""
 
-        cutoff = _plain_date(as_of_date, "as_of_date")
-        self._calendar.day(cutoff)
+        cutoff = self._checked_cutoff(as_of_date)
         if lookback_trading_days is not None:
             if type(lookback_trading_days) is not int or lookback_trading_days <= 0:
                 raise ValueError("lookback_trading_days must be a positive integer")
@@ -333,28 +300,8 @@ class DailyDataPortal:
             result[index_code] = eligible
         return MappingProxyType(result)
 
-    def history_for_symbol(
-        self,
-        symbol: str,
-        as_of_date: date,
-        *,
-        lookback_trading_days: int | None = None,
-    ) -> tuple[MarketBarView, ...]:
-        canonical = normalize_symbol(symbol)
-        return self.views_through(
-            as_of_date,
-            symbols=(canonical,),
-            lookback_trading_days=lookback_trading_days,
-        )
 
-    def front_view(self, symbol: str, trade_date: date) -> MarketBarView:
-        canonical = normalize_symbol(symbol)
-        value = self._calendar.require_trading_day(trade_date)
-        try:
-            return self._views_by_date[value][canonical]
-        except KeyError:
-            raise LookupError(f"no active front view for {canonical} on {value}") from None
-
+    # 按起止区间返回连续有序的执行行情帧。
     def execution_frames(self, start_date: date, end_date: date) -> tuple[MarketFrame, ...]:
         trading_dates = self._calendar.trading_dates(start_date, end_date)
         return tuple(
@@ -363,6 +310,13 @@ class DailyDataPortal:
             if (frame := self._frames_by_date.get(trade_date)) is not None
         )
 
+    def _checked_cutoff(self, as_of_date: date) -> date:
+        """所有策略历史查询共用的日期类型与日历覆盖检查。"""
+        cutoff = _plain_date(as_of_date, "as_of_date")
+        self._calendar.day(cutoff)
+        return cutoff
+
+    # 校验调用方请求的证券属于已加载范围，并规范返回顺序。
     def _selected_symbols(self, symbols: Sequence[str] | None) -> frozenset[str]:
         if symbols is None:
             return frozenset(self._symbols)
@@ -374,6 +328,7 @@ class DailyDataPortal:
             raise ValueError(f"strategy history symbols are outside the universe: {unknown!r}")
         return selected
 
+    # 索引并校验 ETF 主信息，避免证券重复或元数据冲突。
     @staticmethod
     def _index_infos(infos: Sequence[EtfInfo], symbols: tuple[str, ...]) -> dict[str, EtfInfo]:
         indexed: dict[str, EtfInfo] = {}
@@ -387,6 +342,7 @@ class DailyDataPortal:
             raise DataQualityError("EtfInfo rows must exactly cover dataset symbols")
         return dict(sorted(indexed.items()))
 
+    # 检查每只证券在有效上市区间内的行情覆盖，避免静默跳过缺失交易日。
     @staticmethod
     def _validate_active_coverage(
         *,

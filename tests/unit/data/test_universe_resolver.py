@@ -1,4 +1,4 @@
-"""Frozen explicit-plus-pool universe resolution tests."""
+"""冻结显式证券与资产池并集的证券范围解析测试。"""
 
 from __future__ import annotations
 

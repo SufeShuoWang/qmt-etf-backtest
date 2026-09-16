@@ -1,0 +1,39 @@
+config_version: "4.0"
+account:
+  mode: "PAPER"
+  system_path: "qmt_example/configs/system.yaml"
+  account_id: "66629053"
+  account_type: "STOCK"
+strategy:
+  strategy_id: "xgboost_three_factor"
+  case: "model"
+  experiment_path: "private_strategy/xgboost_example/experiment.yaml"
+  initial_capital: "10000"
+  schedule_anchor_date: 2021-01-04
+  model:
+    backend: "xgboost"
+    device: "cpu"  # 推理设备独立于训练设备；可改为 "cuda" 或 "cuda:0"。
+    # Run the backtest first, then copy its artifact to this path.
+    bundle_path: "private_strategy/xgboost_example/model_bundle.ubj"
+miniqmt:
+  userdata_path: "D:/国金QMT交易端模拟/userdata_mini"
+  session_id: 100001
+  reconnect_interval_seconds: 5
+signal: {run_time: "20:40:00"}
+execution:
+  policy: "NEAR_CLOSE_LIMIT"
+  submit_start: "14:50:00"
+  sell_phase_deadline: "14:53:00"
+  stop_new_orders: "14:56:00"
+  cancel_open_orders: "14:57:00"
+  cancel_confirm_timeout_seconds: 60
+  price_offset_ticks: 2
+  quote_stale_seconds: 5
+  lot_size: 100
+  order_type: "FIX_PRICE"
+eod: {run_time: "20:30:00"}
+risk:
+  max_single_order_notional: "200000"
+  max_daily_order_notional: "500000"
+  min_order_notional: "100"
+  max_total_target_weight: "1.0"

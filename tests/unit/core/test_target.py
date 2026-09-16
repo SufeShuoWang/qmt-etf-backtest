@@ -1,4 +1,4 @@
-"""Contract tests for the strategy's immutable target-portfolio output."""
+"""策略不可变目标组合输出的契约测试。"""
 
 from decimal import Decimal
 
@@ -11,7 +11,6 @@ from etf_backtest.core.target import TargetPortfolio
 @pytest.mark.parametrize(
     "weights",
     [
-        {},
         {"SH.510300": Decimal("0")},
         {"SH.510300": Decimal("1")},
         {"SH.510300": Decimal("0.60"), "SH.518880": Decimal("0.30")},
@@ -26,11 +25,17 @@ def test_target_portfolio_accepts_valid_decimal_weights(
 
 
 @pytest.mark.unit
-def test_target_portfolio_returns_zero_for_an_omitted_symbol() -> None:
+def test_target_portfolio_returns_none_for_an_omitted_symbol() -> None:
     target = TargetPortfolio(weights={"510300": Decimal("0.75")})
 
-    assert target.weight_for("518880") == Decimal("0")
+    assert target.weight_for("518880") is None
     assert tuple(target.weights) == ("SH.510300",)
+
+
+@pytest.mark.unit
+def test_target_portfolio_rejects_an_empty_explicit_target() -> None:
+    with pytest.raises(ValueError, match="at least one explicit target"):
+        TargetPortfolio(weights={})
 
 
 @pytest.mark.unit

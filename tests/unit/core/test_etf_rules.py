@@ -1,4 +1,4 @@
-"""Public pure-daily ETF rule engine regression tests."""
+"""公开纯日频 ETF 规则引擎回归测试。"""
 
 from __future__ import annotations
 

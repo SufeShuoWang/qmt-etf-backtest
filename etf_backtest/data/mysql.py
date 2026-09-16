@@ -1,11 +1,13 @@
-"""Read-only adapter for the unified QMT daily MySQL dataset."""
+"""统一 QMT 日频 MySQL 数据集的只读适配器。"""
 
 from __future__ import annotations
+
 
 import csv
 import hashlib
 import re
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
@@ -14,9 +16,10 @@ from types import MappingProxyType
 from typing import Final
 
 from sqlalchemy import bindparam, text
-from sqlalchemy.engine import Engine, RowMapping
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.sql.base import Executable
 
+from etf_backtest.validation import non_blank as _non_blank, plain_date as _plain_date
 from etf_backtest.config.schema import (
     MARKET_TIMEZONE,
     etf_code,
@@ -50,18 +53,10 @@ HUIJIN_ENTITIES: Final = (
 
 
 class QmtDataQualityError(ValueError):
-    """A frozen QMT slice cannot satisfy the daily backtest contract."""
+    """冻结的 QMT 数据切片无法满足日频回测契约。"""
 
 
-def _non_blank(value: object, field_name: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be a string")
-    normalized = value.strip()
-    if not normalized:
-        raise ValueError(f"{field_name} must not be blank")
-    return normalized
-
-
+# 检查 SQL 标识符格式，避免把任意文本拼入表名或列名。
 def _sql_identifier(value: object, field_name: str) -> str:
     normalized = _non_blank(value, field_name)
     if _SQL_IDENTIFIER.fullmatch(normalized) is None:
@@ -69,12 +64,7 @@ def _sql_identifier(value: object, field_name: str) -> str:
     return normalized
 
 
-def _plain_date(value: object, field_name: str) -> date:
-    if isinstance(value, datetime) or not isinstance(value, date):
-        raise TypeError(f"{field_name} must be datetime.date")
-    return value
-
-
+# 生成包含起止端点的自然日期序列，供日历完整性检查。
 def _closed_dates(start_date: date, end_date: date) -> tuple[date, date]:
     start = _plain_date(start_date, "start_date")
     end = _plain_date(end_date, "end_date")
@@ -83,6 +73,7 @@ def _closed_dates(start_date: date, end_date: date) -> tuple[date, date]:
     return start, end
 
 
+# 将数据库数值转换为满足约束的 Decimal。
 def _decimal(value: object, field_name: str, *, positive: bool = False) -> Decimal:
     if not isinstance(value, Decimal):
         raise TypeError(f"{field_name} must be Decimal")
@@ -95,6 +86,7 @@ def _decimal(value: object, field_name: str, *, positive: bool = False) -> Decim
     return value
 
 
+# 转换允许带正负号的数据库 Decimal 字段，同时拒绝无效数值。
 def _signed_decimal(value: object, field_name: str) -> Decimal:
     if not isinstance(value, Decimal):
         raise TypeError(f"{field_name} must be Decimal")
@@ -103,6 +95,7 @@ def _signed_decimal(value: object, field_name: str) -> Decimal:
     return value
 
 
+# 把数据库状态值转换为布尔值，拒绝无法识别的表示。
 def _bool(value: object, field_name: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -111,6 +104,7 @@ def _bool(value: object, field_name: str) -> bool:
     raise TypeError(f"{field_name} must be bool or database 0/1")
 
 
+# 从数据库 ETF 代码与市场信息构造内部标准证券代码。
 def _canonical_symbol(etf_code: object, qmt_symbol: object, exchange: object) -> str:
     code = _non_blank(etf_code, "etf_code")
     if len(code) != 6 or not code.isdigit():
@@ -129,10 +123,12 @@ def _canonical_symbol(etf_code: object, qmt_symbol: object, exchange: object) ->
     return inferred
 
 
+# 提取标准证券代码中的六位基金代码，供数据库查询使用。
 def _code_for_symbol(symbol: str) -> str:
     return normalize_symbol(symbol).partition(".")[2]
 
 
+# 规范、去重并排序待查询的证券代码。
 def _normalize_symbols(symbols: Sequence[str]) -> tuple[str, ...]:
     if isinstance(symbols, (str, bytes)) or not isinstance(symbols, Sequence):
         raise TypeError("symbols must be a sequence of strings")
@@ -142,21 +138,24 @@ def _normalize_symbols(symbols: Sequence[str]) -> tuple[str, ...]:
     return canonical
 
 
+# 把交易日期与指定日内时刻组合成带市场时区的时间戳。
 def _local_datetime(trade_date: date, local_time: time) -> datetime:
     return datetime.combine(trade_date, local_time, tzinfo=MARKET_TIMEZONE)
 
 
+# 组合数据库行的来源主键，供行情与结果溯源。
 def _source_record_key(*, symbol: str, trade_date: date, dataset_version: str) -> str:
     return f"QMT:{dataset_version}:{etf_code(symbol)}:{trade_date.isoformat()}"
 
 
+# 为停牌缺口承接行情生成来源键，明确其引用了之前的数据。
 def _carry_source_record_key(*, symbol: str, trade_date: date, dataset_version: str) -> str:
     return f"CARRY:{dataset_version}:{etf_code(symbol)}:{trade_date.isoformat()}"
 
 
 @dataclass(frozen=True, slots=True)
 class QmtEtfMasterRecord:
-    """Current ETF master row used only for explicit-universe validation."""
+    """仅用于校验显式证券范围的当前 ETF 主表记录。"""
 
     symbol: str
     etf_code: str
@@ -174,7 +173,7 @@ class QmtEtfMasterRecord:
 
 @dataclass(frozen=True, slots=True)
 class QmtSseCalendarDay:
-    """One source-versioned SSE natural date from ``dim_trading_calendar``."""
+    """来自 ``dim_trading_calendar`` 且带数据源版本的单个上交所自然日。"""
 
     cal_date: date
     is_open: bool
@@ -183,6 +182,7 @@ class QmtSseCalendarDay:
     source_system: str
     calendar_version: str
 
+    # 检查 SSE 自然日记录的日期、开市状态及相邻交易日信息。
     def __post_init__(self) -> None:
         _plain_date(self.cal_date, "cal_date")
         if not isinstance(self.is_open, bool):
@@ -195,7 +195,7 @@ class QmtSseCalendarDay:
 
 @dataclass(frozen=True, slots=True)
 class QmtRawDailyBar:
-    """Unadjusted QMT daily row with its lossless string provenance key."""
+    """未复权 QMT 日频记录及其无损字符串来源键。"""
 
     source_record_key: str
     symbol: str
@@ -211,6 +211,7 @@ class QmtRawDailyBar:
     amount: Decimal
     source_system: str
 
+    # 校验数据库原始日线记录及其来源字段。
     def __post_init__(self) -> None:
         _non_blank(self.source_record_key, "source_record_key")
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
@@ -227,6 +228,7 @@ class QmtRawDailyBar:
         if self.source_system != _QMT_SOURCE:
             raise QmtDataQualityError("raw source_system must be QMT")
 
+    # 将数据库原始日线记录转换为执行与估值使用的 MarketBar。
     def to_market_bar(
         self,
         *,
@@ -259,7 +261,7 @@ class QmtRawDailyBar:
 
 @dataclass(frozen=True, slots=True)
 class QmtFrontDailyBar:
-    """One front-adjusted QMT daily bar keyed by ETF and trade date."""
+    """按 ETF 和交易日期索引的单条前复权 QMT 日频行情。"""
 
     source_record_key: str
     symbol: str
@@ -270,6 +272,7 @@ class QmtFrontDailyBar:
     close: Decimal
     source_system: str
 
+    # 校验数据库前复权日线记录，供策略历史视图使用。
     def __post_init__(self) -> None:
         _non_blank(self.source_record_key, "source_record_key")
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
@@ -286,7 +289,7 @@ class QmtFrontDailyBar:
 
 @dataclass(frozen=True, slots=True)
 class QmtTradeStatusRecord:
-    """Source-native QMT status (including unknown) and optional legal-price pair."""
+    """QMT 数据源原生状态（含未知状态）及可选法定价格上下限。"""
 
     symbol: str
     trade_date: date
@@ -296,6 +299,7 @@ class QmtTradeStatusRecord:
     qmt_source_system: str | None
     price_limit_source_system: str | None
 
+    # 校验交易状态记录中的日期、停牌及涨跌停字段。
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
         _plain_date(self.trade_date, "trade_date")
@@ -324,10 +328,12 @@ class QmtTradeStatusRecord:
             if _non_blank(self.price_limit_source_system, "price_limit_source_system") != "TUSHARE":
                 raise QmtDataQualityError("explicit price-limit source_system must be TUSHARE")
 
+    # 根据数据库交易状态记录判断是否停牌。
     @property
     def suspended(self) -> bool:
         return self.qmt_suspend_flag == 1
 
+    # 从状态记录提取显式涨跌停价格；未提供时留给后续规则推导。
     def explicit_price_limit(self) -> QmtExplicitPriceLimit | None:
         if self.price_limit_down is None or self.price_limit_up is None:
             return None
@@ -342,7 +348,7 @@ class QmtTradeStatusRecord:
 
 @dataclass(frozen=True, slots=True)
 class QmtExplicitPriceLimit:
-    """One complete Tushare legal-price pair from the auxiliary daily table."""
+    """来自辅助日表的一组完整 Tushare 法定价格上下限。"""
 
     symbol: str
     trade_date: date
@@ -350,6 +356,7 @@ class QmtExplicitPriceLimit:
     price_limit_up: Decimal
     source_system: str
 
+    # 检查显式涨跌停价格为合法且有序的价格区间。
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
         _plain_date(self.trade_date, "trade_date")
@@ -363,13 +370,14 @@ class QmtExplicitPriceLimit:
 
 @dataclass(frozen=True, slots=True)
 class QmtEtfShareRecord:
-    """One ``etf_share_daily`` business-date record."""
+    """单条 ``etf_share_daily`` 业务日期记录。"""
 
     symbol: str
     asof_date: date
     total_share: Decimal
     source_system: str
 
+    # 校验某只 ETF 在指定日期的精确份额观察值。
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
         _plain_date(self.asof_date, "asof_date")
@@ -380,13 +388,14 @@ class QmtEtfShareRecord:
 
 @dataclass(frozen=True, slots=True)
 class HuijinHolderRatioRecord:
-    """One company/ETF/report-period HolderOfListing ratio as a Decimal fraction."""
+    """以 Decimal 小数表示的单个公司、ETF 和报告期 HolderOfListing 比例。"""
 
     symbol: str
     end_date: date
     entity: str
     ratio: Decimal
 
+    # 校验汇金主体、报告期和持有比例；报告期与披露日的区别需在数据来源处确认。
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
         _plain_date(self.end_date, "end_date")
@@ -401,7 +410,7 @@ class HuijinHolderRatioRecord:
 
 @dataclass(frozen=True, slots=True)
 class QmtDailyFrame:
-    """One open SSE date with raw and front records in separate immutable maps."""
+    """单个上交所开市日，原始记录和前复权记录分别存于不可变映射。"""
 
     trade_date: date
     bar_start_time: datetime
@@ -412,6 +421,7 @@ class QmtDailyFrame:
     price_limits_by_symbol: Mapping[str, QmtExplicitPriceLimit] = field(default_factory=dict)
     carried_symbols: frozenset[str] = frozenset()
 
+    # 校验同一日数据库行情帧中原始与前复权记录的对应关系。
     def __post_init__(self) -> None:
         raw = dict(sorted(self.raw_by_symbol.items()))
         front = dict(sorted(self.front_by_symbol.items()))
@@ -460,6 +470,7 @@ class QmtDailyFrame:
         object.__setattr__(self, "price_limits_by_symbol", MappingProxyType(limits))
         object.__setattr__(self, "carried_symbols", carried)
 
+    # 将数据库日帧转换为回测执行用的 MarketFrame。
     def to_market_frame(self, *, calendar_version: str) -> MarketFrame:
         frame_key = FrameKey(
             trade_date=self.trade_date,
@@ -484,7 +495,7 @@ class QmtDailyFrame:
 
 @dataclass(frozen=True, slots=True)
 class QmtDailyDataset:
-    """Fully preflighted, frozen daily data contract for one SSE run."""
+    """经完整预检并冻结的单次上交所日频运行数据契约。"""
 
     symbols: tuple[str, ...]
     start_date: date
@@ -502,20 +513,20 @@ class QmtDailyDataset:
 
     @property
     def explicit_price_limit_count(self) -> int:
-        """Number of execution bars backed by a complete explicit legal-price pair."""
+        """具备完整显式法定价格上下限的执行行情数量。"""
 
         return sum(len(frame.price_limits_by_symbol) for frame in self.frames)
 
     @property
     def derived_price_limit_fallback_count(self) -> int:
-        """Number of execution bars that must use the effective-ratio fallback."""
+        """必须使用有效比例回退规则的执行行情数量。"""
 
         return (
             sum(len(frame.raw_by_symbol) for frame in self.frames) - self.explicit_price_limit_count
         )
 
     def market_frames(self) -> tuple[MarketFrame, ...]:
-        """Return raw domain frames with stable dataset source keys."""
+        """返回带稳定数据集来源键的原始领域行情帧。"""
 
         frames = tuple(
             frame.to_market_frame(
@@ -529,7 +540,7 @@ class QmtDailyDataset:
         return frames
 
     def front_market_bar_views(self) -> tuple[MarketBarView, ...]:
-        """Return front-ratio strategy views paired to raw execution records."""
+        """返回与原始执行记录逐一配对的前复权策略视图。"""
 
         views: list[MarketBarView] = []
         for frame in self.frames:
@@ -556,12 +567,14 @@ class QmtDailyDataset:
 
 
 class QmtDailyRepository:
-    """Read-only repository over one unified QMT database connection."""
+    """基于单个统一 QMT 数据库连接的只读仓储。"""
 
+    # 绑定 SQLAlchemy 引擎、数据版本和数据来源设置；查询通过只读方法完成。
     def __init__(
         self,
         engine: Engine,
         *,
+        connection: Connection | None = None,
         dataset_version: str,
         calendar_source: str = _SSE_SOURCE,
         trade_status_table: str = "etf_trade_status_daily",
@@ -572,6 +585,7 @@ class QmtDailyRepository:
         huijin_holders_csv_sha256: str | None = None,
     ) -> None:
         self._engine = engine
+        self._connection = connection
         self._dataset_version = _non_blank(dataset_version, "dataset_version")
         self._calendar_source = _non_blank(calendar_source, "calendar_source")
         self._trade_status_table = _sql_identifier(trade_status_table, "trade_status_table")
@@ -599,22 +613,31 @@ class QmtDailyRepository:
                 raise ValueError("huijin_holders_csv_sha256 must be a lowercase SHA-256 digest")
             self._huijin_holders_csv_sha256 = digest
 
+    # 返回仓库当前使用的数据集版本。
     @property
     def dataset_version(self) -> str:
         return self._dataset_version
 
+    # 返回仓库读取 SSE 日历时使用的来源标识。
     @property
     def calendar_source(self) -> str:
         return self._calendar_source
 
+    # 执行参数化 SQL 查询并返回映射行，统一管理查询连接。
     def _fetch(
         self, statement: Executable, parameters: Mapping[str, object]
-    ) -> list[Mapping[str, object]]:
-        with self._engine.connect() as connection:
+    ) -> Sequence[Mapping[str, object]]:
+        # 借用已有连接时不关闭它；查询结果在连接退出前全部取回。
+        scope = (
+            nullcontext(self._connection)
+            if self._connection is not None
+            else self._engine.connect()
+        )
+        with scope as connection:
             result = connection.execute(statement, dict(parameters))
-            rows: Sequence[RowMapping] = result.mappings().all()
-            return [dict(row) for row in rows]
+            return result.mappings().all()
 
+    # 按显式证券读取 ETF 当前主表记录，供资产池冻结和生命周期解析。
     def load_etf_master(self, symbols: Sequence[str]) -> tuple[QmtEtfMasterRecord, ...]:
         requested = _normalize_symbols(symbols)
         requested_by_code = {_code_for_symbol(symbol): symbol for symbol in requested}
@@ -645,7 +668,7 @@ class QmtDailyRepository:
         return tuple(records[symbol] for symbol in requested)
 
     def load_pool_etf_master(self, pool_name: str) -> tuple[QmtEtfMasterRecord, ...]:
-        """Resolve one supported current-master pool without using status filters."""
+        """解析当前主表中的单个受支持资产池，不使用状态过滤。"""
 
         pool = _non_blank(pool_name, "pool_name")
         conditions = {
@@ -681,7 +704,7 @@ class QmtDailyRepository:
         return tuple(indexed[symbol] for symbol in sorted(indexed))
 
     def load_last_raw_trade_dates(self, symbols: Sequence[str]) -> Mapping[str, date]:
-        """Load the last raw business date in the unified dataset."""
+        """加载统一数据集中的最后一个原始业务日期。"""
 
         requested = _normalize_symbols(symbols)
         codes = [_code_for_symbol(symbol) for symbol in requested]
@@ -710,9 +733,8 @@ class QmtDailyRepository:
             result[symbol] = _plain_date(row["last_trade_date"], "last_trade_date")
         return MappingProxyType(dict(sorted(result.items())))
 
-    def load_etf_info(self, symbols: Sequence[str]) -> tuple[EtfInfo, ...]:
-        return self._infos_from_master(self.load_etf_master(symbols))
 
+    # 将 ETF 主表查询行转换为统一的主信息记录。
     @classmethod
     def _master_record_from_row(cls, row: Mapping[str, object]) -> QmtEtfMasterRecord:
         raw_code = _non_blank(row["etf_code"], "etf_code")
@@ -737,6 +759,7 @@ class QmtDailyRepository:
             source_system=_non_blank(row["source_system"], "source_system"),
         )
 
+    # 读取指定日期区间的 SSE 日历，并校验自然日覆盖及交易日关联。
     def load_sse_calendar(self, start_date: date, end_date: date) -> tuple[QmtSseCalendarDay, ...]:
         start, end = _closed_dates(start_date, end_date)
         rows = self._fetch(
@@ -789,29 +812,6 @@ class QmtDailyRepository:
         self._validate_calendar_links(days)
         return tuple(days)
 
-    def load_trading_calendar(
-        self,
-        start_date: date,
-        end_date: date,
-        calendar_source: str,
-        calendar_version: str,
-    ) -> tuple[QmtSseCalendarDay, ...]:
-        """Load the frozen SSE calendar after checking its requested identity."""
-
-        if _non_blank(calendar_source, "calendar_source") != self._calendar_source:
-            raise ValueError("calendar_source does not match frozen QMT repository")
-        if _non_blank(calendar_version, "calendar_version") != self._dataset_version:
-            raise ValueError("calendar_version does not match frozen QMT repository")
-        return self.load_sse_calendar(start_date, end_date)
-
-    def load_front_daily_bars(
-        self, symbols: Sequence[str], start_date: date, end_date: date
-    ) -> tuple[QmtFrontDailyBar, ...]:
-        return tuple(
-            factor
-            for frame in self.load_daily_dataset(symbols, start_date, end_date).frames
-            for factor in frame.front_by_symbol.values()
-        )
 
     def load_etf_share_records(
         self,
@@ -819,7 +819,7 @@ class QmtDailyRepository:
         start_date: date,
         end_date: date,
     ) -> tuple[QmtEtfShareRecord, ...]:
-        """Load exact daily total-share observations without forward filling."""
+        """加载精确的每日总份额观察值，不进行前向填充。"""
 
         if self._share_table is None:
             return ()
@@ -874,7 +874,7 @@ class QmtDailyRepository:
         start_date: date,
         end_date: date,
     ) -> tuple[IndexBarView, ...]:
-        """Load configured PRICE index bars for Rule use without ETF normalization."""
+        """加载供 Rule 使用的已配置 PRICE 指数行情，不执行 ETF 代码规范化。"""
 
         if self._index_table is None:
             return ()
@@ -941,7 +941,7 @@ class QmtDailyRepository:
         self,
         symbols: Sequence[str],
     ) -> tuple[HuijinHolderRatioRecord, ...]:
-        """Read and aggregate the two configured Huijin HolderOfListing percentages."""
+        """读取并汇总两个已配置汇金主体的 HolderOfListing 百分比。"""
 
         if self._huijin_holders_csv is None:
             return ()
@@ -991,6 +991,7 @@ class QmtDailyRepository:
             for (symbol, end_date, entity), ratio in sorted(aggregated.items())
         )
 
+    # 数据准备主入口：读取日历、成对日线与状态，处理允许的孤立停牌缺口并核对生命周期覆盖，返回冻结数据集。
     def load_daily_dataset(
         self,
         symbols: Sequence[str],
@@ -999,12 +1000,10 @@ class QmtDailyRepository:
         *,
         etf_infos: Sequence[EtfInfo] | None = None,
     ) -> QmtDailyDataset:
-        """Load and preflight one complete SSE daily slice.
+        """加载并预检完整的上交所日频数据切片。
 
-        Raw and front rows are read directly by their unified business keys.
-        Their business keys must then match one-to-one and must exactly
-        cover every requested symbol on every open date within its inclusive
-        listing interval.
+        原始记录和前复权记录均按统一业务键直接读取，两类业务键必须一一对应，并精确覆盖
+        每只请求证券在其闭区间上市期内的每个开市日。
         """
 
         requested = _normalize_symbols(symbols)
@@ -1163,12 +1162,11 @@ class QmtDailyRepository:
         raw_by_key: Mapping[tuple[str, date], QmtRawDailyBar],
         price_limits_by_key: Mapping[tuple[str, date], QmtExplicitPriceLimit],
     ) -> dict[tuple[str, date], QmtExplicitPriceLimit]:
-        """Expand only a cent-rounded Tushare boundary reached by the QMT close.
+        """仅在 QMT 收盘价触及按分取整的 Tushare 边界时扩展该边界。
 
-        Some historical Tushare limits are rounded to CNY 0.01 while QMT ETF
-        bars retain the legal CNY 0.001 tick.  A difference of at most half a
-        cent is reconciled only when the close is also the session high/low;
-        wider or non-boundary conflicts continue to fail frame preflight.
+        部分历史 Tushare 涨跌停价按人民币 0.01 元取整，而 QMT ETF 行情保留法定的
+        0.001 元最小变动单位。仅当收盘价同时为当日最高价或最低价，且差异不超过半分时
+        才进行协调；差异更大或并非边界冲突时，行情帧预检仍会失败。
         """
 
         reconciled = dict(price_limits_by_key)
@@ -1211,7 +1209,7 @@ class QmtDailyRepository:
         dict[tuple[str, date], QmtFrontDailyBar],
         tuple[tuple[str, date], ...],
     ]:
-        """Carry raw/front separately for an isolated, status-recorded source gap."""
+        """对已记录状态的孤立数据源缺口，分别延续原始价和前复权价。"""
 
         raw = dict(raw_by_key)
         front = dict(front_by_key)
@@ -1269,34 +1267,8 @@ class QmtDailyRepository:
             carried.append((symbol, trade_date))
         return raw, front, tuple(carried)
 
-    def preflight_daily_slice(
-        self,
-        symbols: Sequence[str],
-        start_date: date,
-        end_date: date,
-        *,
-        etf_infos: Sequence[EtfInfo] | None = None,
-    ) -> QmtDailyDataset:
-        """Return the frozen dataset only if every daily preflight check passes."""
 
-        return self.load_daily_dataset(
-            symbols,
-            start_date,
-            end_date,
-            etf_infos=etf_infos,
-        )
-
-    def load_raw_bars(
-        self,
-        symbols: Sequence[str],
-        start_date: date,
-        end_date: date,
-    ) -> tuple[MarketBar, ...]:
-        dataset = self.load_daily_dataset(symbols, start_date, end_date)
-        return tuple(
-            bar for frame in dataset.market_frames() for bar in frame.bars_by_symbol.values()
-        )
-
+    # 将原始日线查询结果转换为按证券、日期索引的记录，并检查重复。
     def _raw_records(
         self, symbols: tuple[str, ...], start_date: date, end_date: date
     ) -> tuple[dict[tuple[str, date], QmtRawDailyBar], set[tuple[str, date]]]:
@@ -1374,6 +1346,7 @@ class QmtDailyRepository:
             )
         return indexed, incomplete
 
+    # 将交易状态查询结果转换为索引记录，供停牌与显式价格限制处理。
     def _trade_status_records(
         self, symbols: tuple[str, ...], start_date: date, end_date: date
     ) -> dict[tuple[str, date], QmtTradeStatusRecord]:
@@ -1438,6 +1411,7 @@ class QmtDailyRepository:
             )
         return indexed
 
+    # 将前复权日线查询结果转换为索引记录，并检查重复。
     def _front_records(
         self, symbols: tuple[str, ...], start_date: date, end_date: date
     ) -> dict[tuple[str, date], QmtFrontDailyBar]:
@@ -1489,11 +1463,13 @@ class QmtDailyRepository:
             )
         return indexed
 
+    # 核对同证券同日的原始与前复权记录，防止缺失或错配进入数据集。
     @staticmethod
     def _validate_raw_front_pair(raw: QmtRawDailyBar, front: QmtFrontDailyBar) -> None:
         if raw.symbol != front.symbol or raw.trade_date != front.trade_date:
             raise QmtDataQualityError("raw/front business keys differ")
 
+    # 从主表记录生成回测所需的 ETF 生命周期信息。
     @staticmethod
     def _infos_from_master(
         master: Sequence[QmtEtfMasterRecord],
@@ -1512,6 +1488,7 @@ class QmtDailyRepository:
             for record in master
         )
 
+    # 检查冻结证券的生命周期信息是否完整且与请求范围一致。
     @classmethod
     def _validate_lifecycle_infos(
         cls,
@@ -1550,6 +1527,7 @@ class QmtDailyRepository:
                     )
         return tuple(provided[symbol] for symbol in requested)
 
+    # 检查数据库日历中的前后交易日引用是否与实际开市记录相符。
     @staticmethod
     def _validate_calendar_links(days: Sequence[QmtSseCalendarDay]) -> None:
         by_date = {day.cal_date: day for day in days}
@@ -1561,10 +1539,12 @@ class QmtDailyRepository:
             if index + 1 < len(open_dates) and day.next_open_date != open_dates[index + 1]:
                 raise QmtDataQualityError(f"SSE next_open_date chain conflict on {trade_date}")
 
+    # 将可空数据库日期转换为 date 或 None。
     @staticmethod
     def _optional_date(value: object, field_name: str) -> date | None:
         return None if value is None else _plain_date(value, field_name)
 
+    # 将可空数据库文本转换为规范字符串或 None。
     @staticmethod
     def _optional_string(value: object) -> str | None:
         return None if value is None else _non_blank(value, "optional string")

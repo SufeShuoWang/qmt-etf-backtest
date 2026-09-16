@@ -1,4 +1,4 @@
-"""Manifest-backed effective ETF rule tests."""
+"""由清单支持的有效 ETF 规则测试。"""
 
 from __future__ import annotations
 

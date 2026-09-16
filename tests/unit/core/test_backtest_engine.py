@@ -1,4 +1,4 @@
-"""D signal to D+1 close execution regression."""
+"""D 日信号到 D+1 日收盘执行的回归测试。"""
 
 import inspect
 from dataclasses import replace

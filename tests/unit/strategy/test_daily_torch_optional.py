@@ -1,4 +1,4 @@
-"""Optional PyTorch import boundary tests."""
+"""可选 PyTorch 导入边界测试。"""
 
 import pytest
 

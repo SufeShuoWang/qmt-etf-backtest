@@ -1,21 +1,25 @@
-"""Immutable daily-close order, approval and formal-fill contracts."""
+"""不可变的日频收盘订单、审批和正式成交契约。"""
 
 from __future__ import annotations
+
 
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import StrEnum
 
+from etf_backtest.validation import plain_date as _plain_date
 from etf_backtest.config.schema import MARKET_TIMEZONE, normalize_symbol
 from etf_backtest.core.market import PriceLimitSource
 
 
+# 定义订单的买入与卖出方向，供生成、审批和成交模块统一使用。
 class OrderSide(StrEnum):
     BUY = "BUY"
     SELL = "SELL"
 
 
+# 枚举订单规则检查的通过／拒绝原因，供结果记录和解释使用。
 class RuleReasonCode(StrEnum):
     APPROVED = "APPROVED"
     LISTING_OR_WINDOW = "LISTING_OR_WINDOW"
@@ -28,11 +32,13 @@ class RuleReasonCode(StrEnum):
     INSUFFICIENT_CASH = "INSUFFICIENT_CASH"
 
 
+# 枚举成交结果状态，区分成交与未成交情形。
 class FillStatus(StrEnum):
     FILLED = "FILLED"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
 
 
+# 校验订单标识和来源等文本字段非空。
 def _text(value: object, field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string")
@@ -42,12 +48,7 @@ def _text(value: object, field_name: str) -> str:
     return normalized
 
 
-def _plain_date(value: object, field_name: str) -> date:
-    if isinstance(value, datetime) or not isinstance(value, date):
-        raise TypeError(f"{field_name} must be datetime.date")
-    return value
-
-
+# 校验订单或成交数量为符合要求的整数。
 def _quantity(value: object, field_name: str, *, positive: bool = False) -> int:
     if type(value) is not int:
         raise TypeError(f"{field_name} must be an integer")
@@ -58,6 +59,7 @@ def _quantity(value: object, field_name: str, *, positive: bool = False) -> int:
     return value
 
 
+# 校验订单链路中的 Decimal 金额和价格。
 def _money(
     value: object,
     field_name: str,
@@ -78,7 +80,7 @@ def _money(
 
 @dataclass(frozen=True, slots=True)
 class Order:
-    """A target-derived quantity bound to the next SSE close."""
+    """由目标推导并绑定到下一上交所收盘时点的数量。"""
 
     order_id: str
     signal_date: date
@@ -88,6 +90,7 @@ class Order:
     requested_quantity: int
     target_value_gap: Decimal
 
+    # 检查订单身份、证券、方向、数量和目标差额等字段。
     def __post_init__(self) -> None:
         object.__setattr__(self, "order_id", _text(self.order_id, "order_id"))
         signal_date = _plain_date(self.signal_date, "signal_date")
@@ -107,7 +110,7 @@ class Order:
 
 @dataclass(frozen=True, slots=True)
 class TradePriceQuote:
-    """One cached raw close quote and its legal daily price boundaries."""
+    """单个缓存的原始收盘报价及其法定日价格边界。"""
 
     source_record_key: str
     symbol: str
@@ -117,6 +120,7 @@ class TradePriceQuote:
     price_limit_up: Decimal
     price_limit_source: PriceLimitSource = PriceLimitSource.DERIVED_RULE_FALLBACK
 
+    # 校验报价来源键、证券、日期和价格限制来源，并要求原始收盘价位于合法上下限内。
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "source_record_key", _text(self.source_record_key, "source_record_key")
@@ -131,10 +135,12 @@ class TradePriceQuote:
         if not isinstance(self.price_limit_source, PriceLimitSource):
             raise TypeError("price_limit_source must be PriceLimitSource")
 
+    # 从报价绑定的行情帧取得交易时间。
     @property
     def trade_time(self) -> datetime:
         return datetime.combine(self.trade_date, time(15, 0), tzinfo=MARKET_TIMEZONE)
 
+    # 返回报价记录的价格来源标识。
     @property
     def price_source(self) -> str:
         return "CLOSE"
@@ -142,7 +148,7 @@ class TradePriceQuote:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionEstimate:
-    """Direction-adjusted price and fee estimate before quantity approval."""
+    """数量审批前按买卖方向调整的价格和费用估算。"""
 
     order_id: str
     requested_quantity: int
@@ -152,6 +158,7 @@ class ExecutionEstimate:
     estimated_fee: Decimal
     estimated_total_cash_required: Decimal
 
+    # 校验成交估计的价格、数量与金额，要求预估金额等于价格乘数量、现金需求等于金额加费用。
     def __post_init__(self) -> None:
         object.__setattr__(self, "order_id", _text(self.order_id, "order_id"))
         quantity = _quantity(self.requested_quantity, "requested_quantity")
@@ -168,7 +175,7 @@ class ExecutionEstimate:
 
 @dataclass(frozen=True, slots=True)
 class RuleCheckResult:
-    """The sole owner of an order's final approved quantity."""
+    """订单最终批准数量的唯一持有者。"""
 
     order_id: str
     requested_quantity: int
@@ -182,6 +189,7 @@ class RuleCheckResult:
     price_limit_source: PriceLimitSource | None = None
     price_limit_fallback_reason: str | None = None
 
+    # 检查审批状态、批准数量及原因是否自洽。
     def __post_init__(self) -> None:
         object.__setattr__(self, "order_id", _text(self.order_id, "order_id"))
         requested = _quantity(self.requested_quantity, "requested_quantity")
@@ -226,7 +234,7 @@ class RuleCheckResult:
 
 @dataclass(frozen=True, slots=True, init=False)
 class FillResult:
-    """A positive formal fill; direct public construction is forbidden."""
+    """数量为正的正式成交；禁止从公开接口直接构造。"""
 
     order_id: str
     signal_date: date
@@ -242,9 +250,11 @@ class FillResult:
     fee: Decimal
     status: FillStatus
 
+    # 构造成交结果并处理构造参数，保留订单与报价的来源关系。
     def __init__(self) -> None:
         raise TypeError("FillResult must be created with from_approved")
 
+    # 检查成交数量、价格、金额、费用及状态之间的一致性。
     def __post_init__(self) -> None:
         _text(self.order_id, "order_id")
         signal = _plain_date(self.signal_date, "signal_date")
@@ -280,7 +290,7 @@ class FillResult:
         trade_amount: Decimal,
         fee: Decimal,
     ) -> FillResult:
-        """Materialize a fill only after preserving every upstream identity."""
+        """保留全部上游身份信息后才生成正式成交。"""
 
         if not approval.passed or approval.approved_quantity <= 0:
             raise ValueError("formal fill requires a positive approval")
@@ -320,10 +330,12 @@ class FillResult:
         instance.__post_init__()
         return instance
 
+    # 返回成交所对应的执行时间。
     @property
     def trade_time(self) -> datetime:
         return datetime.combine(self.execution_date, time(15, 0), tzinfo=MARKET_TIMEZONE)
 
+    # 返回成交使用的报价来源，便于核对原始行情。
     @property
     def price_source(self) -> str:
         return "CLOSE"

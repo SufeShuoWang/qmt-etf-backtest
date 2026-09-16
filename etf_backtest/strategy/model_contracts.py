@@ -1,11 +1,11 @@
-"""Framework-neutral contracts for daily supervised model workflows.
+"""与具体框架无关的日频监督模型工作流契约。
 
-The execution engine intentionally knows only :class:`BaseStrategy`.  This
-module defines the research-side boundary needed by pluggable models without
-introducing a dependency on a numerical or deep-learning framework.
+执行引擎有意只认识 :class:`BaseStrategy`。本模块定义可插拔模型所需的研究侧边界，
+同时不引入对数值计算或深度学习框架的依赖。
 """
 
 from __future__ import annotations
+
 
 import hashlib
 import json
@@ -15,11 +15,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
+from etf_backtest.validation import plain_date as _plain_date
 from etf_backtest.config.schema import normalize_symbol
 from etf_backtest.core.market import MarketBarView
+
+if TYPE_CHECKING:
+    from etf_backtest.strategy.portfolio import ModelPortfolioPolicy
 
 DAILY_FORWARD_RETURN_LABEL = "front_close[D+2]/front_close[D+1]-1"
 MODEL_BUNDLE_SCHEMA_VERSION = "DAILY_MODEL_BUNDLE_V2"
@@ -27,12 +32,7 @@ MODEL_BUNDLE_SCHEMA_VERSION = "DAILY_MODEL_BUNDLE_V2"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _plain_date(value: object, field_name: str) -> date:
-    if isinstance(value, datetime) or not isinstance(value, date):
-        raise TypeError(f"{field_name} must be datetime.date")
-    return value
-
-
+# 规范模型标识等非空文本字段。
 def _non_blank(value: object, field_name: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be str")
@@ -42,6 +42,7 @@ def _non_blank(value: object, field_name: str) -> str:
     return normalized
 
 
+# 检查特征、标签等 Decimal 数值有限，避免 NaN 或无穷参与训练。
 def _finite_decimal(value: object, field_name: str, *, positive: bool = False) -> Decimal:
     if not isinstance(value, Decimal):
         raise TypeError(f"{field_name} must be Decimal")
@@ -53,7 +54,7 @@ def _finite_decimal(value: object, field_name: str, *, positive: bool = False) -
 
 
 def canonical_json(value: Mapping[str, object]) -> str:
-    """Return a stable JSON identity for model or training parameters."""
+    """返回模型或训练参数的稳定 JSON 身份。"""
 
     if not isinstance(value, Mapping):
         raise TypeError("value must be a mapping")
@@ -69,6 +70,7 @@ def canonical_json(value: Mapping[str, object]) -> str:
         raise ValueError("model metadata must be finite and JSON-serializable") from exc
 
 
+# 要求特征名序列非空、名称非空且无重复，并保留特征顺序。
 def validate_feature_names(values: Sequence[str]) -> tuple[str, ...]:
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise TypeError("feature_names must be a sequence")
@@ -80,6 +82,7 @@ def validate_feature_names(values: Sequence[str]) -> tuple[str, ...]:
     return names
 
 
+# 对特征名称顺序与标签名称生成 SHA-256 指纹，识别训练／推理模式是否一致。
 def feature_fingerprint(feature_names: Sequence[str], label_name: str) -> str:
     names = validate_feature_names(feature_names)
     label = _non_blank(label_name, "label_name")
@@ -94,26 +97,30 @@ def feature_fingerprint(feature_names: Sequence[str], label_name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class DateRange:
-    """Inclusive signal-date range for one chronological split."""
+    """单个时间顺序切分使用的信号日期闭区间。"""
 
     start_date: date
     end_date: date
 
+    # 检查日期区间端点是 date 且起点不晚于终点。
     def __post_init__(self) -> None:
         start = _plain_date(self.start_date, "start_date")
         end = _plain_date(self.end_date, "end_date")
         if end < start:
             raise ValueError("end_date must not precede start_date")
 
+    # 判断信号日期是否落在包含端点的区间内。
     def contains(self, value: date) -> bool:
         return self.start_date <= value <= self.end_date
 
+    # 把日期区间转换为可记录的字典。
     def to_dict(self) -> dict[str, str]:
         return {
             "start_date": self.start_date.isoformat(),
             "end_date": self.end_date.isoformat(),
         }
 
+    # 从字典还原并校验日期区间。
     @classmethod
     def from_mapping(cls, value: Mapping[str, object], field_name: str) -> DateRange:
         if not isinstance(value, Mapping):
@@ -128,11 +135,12 @@ class DateRange:
 
 @dataclass(frozen=True, slots=True, order=True)
 class SampleKey:
-    """Stable identity for a model row aligned to signal date ``D``."""
+    """与信号日 ``D`` 对齐的模型记录稳定身份。"""
 
     signal_date: date
     symbol: str
 
+    # 校验样本主键的证券和信号日期，供标签与预测精确对齐。
     def __post_init__(self) -> None:
         _plain_date(self.signal_date, "signal_date")
         object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
@@ -140,11 +148,12 @@ class SampleKey:
 
 @dataclass(frozen=True, slots=True)
 class FeatureRecord:
-    """Framework-neutral Decimal feature vector for one sample key."""
+    """单个样本键对应的框架无关 Decimal 特征向量。"""
 
     key: SampleKey
     features: tuple[Decimal, ...]
 
+    # 校验并冻结一个样本的有限特征向量。
     def __post_init__(self) -> None:
         if not isinstance(self.key, SampleKey):
             raise TypeError("key must be SampleKey")
@@ -158,15 +167,17 @@ class FeatureRecord:
 
 @dataclass(frozen=True, slots=True)
 class LabeledRecord(FeatureRecord):
-    """Feature vector plus the D+1-close-to-D+2-close return label."""
+    """特征向量及 D+1 收盘到 D+2 收盘的收益标签。"""
 
     label: Decimal
 
+    # 校验有标签样本的主键、特征和未来收益标签。
     def __post_init__(self) -> None:
         super(LabeledRecord, self).__post_init__()
         _finite_decimal(self.label, "label")
 
 
+# 校验一组有标签记录的唯一性与特征宽度，并整理为稳定序列。
 def _freeze_labeled_records(
     records: Sequence[LabeledRecord],
     *,
@@ -196,7 +207,7 @@ def _freeze_labeled_records(
 
 @dataclass(frozen=True, slots=True)
 class DatasetSplits:
-    """Qlib-style immutable train/valid/test dataset contract."""
+    """Qlib 风格的不可变 train/valid/test 数据集契约。"""
 
     feature_names: tuple[str, ...]
     label_name: str
@@ -207,6 +218,7 @@ class DatasetSplits:
     valid: tuple[LabeledRecord, ...]
     test: tuple[LabeledRecord, ...]
 
+    # 检查训练／验证／测试区间、非空样本及模式一致性，冻结数据切分。
     def __post_init__(self) -> None:
         names = validate_feature_names(self.feature_names)
         label = _non_blank(self.label_name, "label_name")
@@ -244,6 +256,7 @@ class DatasetSplits:
         object.__setattr__(self, "valid", valid)
         object.__setattr__(self, "test", test)
 
+    # 返回训练样本中最大的信号日期；它表示信号截止日，不是标签收益实现日。
     @property
     def trained_through(self) -> date:
         return max(record.key.signal_date for record in self.train)
@@ -251,11 +264,12 @@ class DatasetSplits:
 
 @dataclass(frozen=True, slots=True)
 class PredictionRecord:
-    """One finite model score aligned to a sample key."""
+    """与样本键对齐的单个有限模型分数。"""
 
     key: SampleKey
     score: float
 
+    # 检查预测主键与得分有效，供逐日组合分配和离线评估。
     def __post_init__(self) -> None:
         if not isinstance(self.key, SampleKey):
             raise TypeError("key must be SampleKey")
@@ -269,13 +283,14 @@ class PredictionRecord:
 
 @dataclass(frozen=True, slots=True)
 class RegressionMetricReport:
-    """Finite regression metrics for one exact prediction alignment."""
+    """针对一次精确预测对齐计算的有限回归指标。"""
 
     sample_count: int
     mean_squared_error: float
     mean_absolute_error: float
     prediction_correlation: float
 
+    # 检查回归评估中的样本数及误差、相关性指标数值。
     def __post_init__(self) -> None:
         if type(self.sample_count) is not int or self.sample_count <= 0:
             raise ValueError("sample_count must be a positive integer")
@@ -291,12 +306,13 @@ class RegressionMetricReport:
 
 @dataclass(frozen=True, slots=True)
 class ModelDataIdentity:
-    """Frozen data identity that a saved model bundle must match on load."""
+    """加载已保存模型 bundle 时必须匹配的冻结数据身份。"""
 
     dataset_version: str
     manifest_sha256: str
     snapshot_started_at_utc: datetime
 
+    # 校验模型使用的数据集版本、清单摘要与快照时间身份。
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "dataset_version", _non_blank(self.dataset_version, "dataset_version")
@@ -315,7 +331,7 @@ class ModelDataIdentity:
 
 @dataclass(frozen=True, slots=True)
 class ModelMetadata:
-    """Self-describing compatibility identity embedded in every bundle."""
+    """嵌入每个 bundle 的自描述兼容性身份。"""
 
     schema_version: str
     model_id: str
@@ -334,6 +350,7 @@ class ModelMetadata:
     framework_name: str
     framework_version: str
 
+    # 校验模型元数据版本、特征指纹、参数 JSON、日期切分和训练截止日等一致性。
     def __post_init__(self) -> None:
         if self.schema_version != MODEL_BUNDLE_SCHEMA_VERSION:
             raise ValueError("unsupported model bundle schema_version")
@@ -379,6 +396,7 @@ class ModelMetadata:
         object.__setattr__(self, "feature_names", names)
         object.__setattr__(self, "feature_fingerprint", fingerprint)
 
+    # 把模型身份、特征模式和日期切分转换为可保存字典。
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
@@ -403,6 +421,7 @@ class ModelMetadata:
             "framework_version": self.framework_version,
         }
 
+    # 从产物字典恢复模型元数据并触发完整校验。
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> ModelMetadata:
         if not isinstance(value, Mapping):
@@ -460,12 +479,14 @@ class ModelMetadata:
             raise ValueError("model metadata is incomplete") from exc
 
 
+# 读取并检查元数据中的映射字段。
 def _mapping_value(value: object, field_name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{field_name} must be a mapping")
     return value
 
 
+# 读取并检查元数据中的严格整数字段。
 def _integer_value(value: object, field_name: str) -> int:
     if type(value) is not int:
         raise TypeError(f"{field_name} must be int")
@@ -474,14 +495,17 @@ def _integer_value(value: object, field_name: str) -> int:
 
 @runtime_checkable
 class FeatureBuilder(Protocol):
-    """User-pluggable, label-free feature calculation visible through D."""
+    """用户可插拔、无标签且只使用截至 D 日可见数据的特征计算。"""
 
+    # 声明特征向量对应的有序名称，训练和推理必须一致。
     @property
     def feature_names(self) -> tuple[str, ...]: ...
 
+    # 声明构建一个信号样本需要的历史交易日窗口长度。
     @property
     def required_history_trading_days(self) -> int: ...
 
+    # 依据单证券截至信号日的历史生成特征序列；历史不足等情况下可返回 None 跳过样本。
     def build_features(
         self,
         *,
@@ -492,72 +516,83 @@ class FeatureBuilder(Protocol):
 
 
 @runtime_checkable
-class TorchModelFactory(Protocol):
-    """Framework-lazy factory for one torch.nn.Module architecture."""
+class ModelSpec(Protocol):
+    """与具体学习框架无关的模型身份与参数。"""
 
+    # 提供稳定模型标识，供产物元数据核对。
     @property
     def model_id(self) -> str: ...
 
+    # 提供模型类名称标识，供训练与加载一致性检查。
     @property
     def model_class_name(self) -> str: ...
 
+    # 提供模型构造／训练算法参数的可序列化映射。
     @property
     def model_parameters(self) -> Mapping[str, object]: ...
 
+
+@runtime_checkable
+class TorchModelFactory(ModelSpec, Protocol):
+    """延迟依赖具体框架的单个 torch.nn.Module 架构工厂。"""
+
+    # 按输入特征宽度创建 Torch 网络，由用户模型工厂实现。
     def create(self, *, input_dim: int, seed: int) -> object: ...
 
 
 @runtime_checkable
 class PredictorBundle(Protocol):
-    """Inference-only bundle consumed by the generic daily model strategy."""
+    """通用日频模型策略使用的纯推理 bundle。"""
 
+    # 提供已训练模型的身份、日期与特征模式元数据。
     @property
     def metadata(self) -> ModelMetadata: ...
 
+    # 对带主键的特征样本批量预测，返回相同主键对应的得分。
     def predict(self, records: Sequence[FeatureRecord]) -> tuple[PredictionRecord, ...]: ...
 
 
-class Dataset(Protocol):
-    """Minimal Qlib-style dataset interface."""
+@runtime_checkable
+class ModelWorkflowResult(Protocol):
+    """不同学习后端共用的拟合结果边界。"""
 
-    feature_names: tuple[str, ...]
-    label_name: str
-    train: tuple[LabeledRecord, ...]
-    valid: tuple[LabeledRecord, ...]
-    test: tuple[LabeledRecord, ...]
+    # 提供训练完成后的可推理模型包。
+    @property
+    def bundle(self) -> PredictorBundle: ...
+
+    # 提供验证集回归评估结果。
+    @property
+    def validation_metrics(self) -> RegressionMetricReport: ...
+
+    # 提供测试集回归评估结果。
+    @property
+    def test_metrics(self) -> RegressionMetricReport: ...
+
+    # 提供最佳轮次、损失等后端训练摘要。
+    @property
+    def fit_summary(self) -> Mapping[str, object]: ...
 
 
-class Model(Protocol):
-    """Minimal Qlib-style fit/predict/save/load model interface."""
+@runtime_checkable
+class ModelWorkflow(Protocol):
+    """回测编排器使用的通用训练与 bundle 持久化接口。"""
 
+    # 提供工作流当前已训练或已加载的预测包。
     @property
     def bundle(self) -> PredictorBundle | None: ...
 
-    def fit(self, dataset: DatasetSplits) -> object: ...
+    # 声明该后端保存模型产物时使用的文件名。
+    @property
+    def bundle_filename(self) -> str: ...
 
-    def save(self, path: object) -> object: ...
+    # 使用既定数据切分训练模型，并返回预测包和评估结果。
+    def fit(self, dataset: DatasetSplits) -> ModelWorkflowResult: ...
 
-    def load(self, path: object, *, dataset: DatasetSplits) -> PredictorBundle: ...
-
-
-class ModelArtifactWriter(Protocol):
-    def write_json_artifact(self, filename: str, payload: Mapping[str, object]) -> object: ...
-
-    def write_csv_artifact(
-        self,
-        filename: str,
-        *,
-        fieldnames: Sequence[str],
-        rows: Sequence[Mapping[str, object]],
-    ) -> object: ...
+    # 把已训练模型与复现所需元数据保存到指定产物路径。
+    def save(self, path: Path, *, source_run_dir: Path | None = None) -> Path: ...
 
 
-class Record(Protocol):
-    """Qlib-style record boundary for model-specific local artifacts."""
-
-    def write(self, writer: ModelArtifactWriter) -> None: ...
-
-
+# 检查特征构建器满足接口、名称模式和回看长度约束。
 def validate_feature_builder(builder: FeatureBuilder) -> tuple[tuple[str, ...], int]:
     if not isinstance(builder, FeatureBuilder):
         raise TypeError("feature_builder must satisfy FeatureBuilder")
@@ -575,7 +610,7 @@ def build_feature_record(
     signal_date: date,
     history: Sequence[MarketBarView],
 ) -> FeatureRecord | None:
-    """Validate one plugin call and freeze its result without future views."""
+    """校验单次插件调用，并在不含未来视图的前提下冻结结果。"""
 
     names, lookback = validate_feature_builder(builder)
     canonical = normalize_symbol(symbol)
@@ -614,7 +649,7 @@ def feature_records_for_signal(
     market_views: Sequence[MarketBarView],
     signal_date: date,
 ) -> tuple[FeatureRecord, ...]:
-    """Build label-free records for every symbol visible through signal D."""
+    """为截至信号日 D 可见的每只证券构建无标签记录。"""
 
     signal = _plain_date(signal_date, "signal_date")
     supplied_views = cast(object, market_views)
@@ -644,6 +679,7 @@ def feature_records_for_signal(
     return tuple(records)
 
 
+# 将预测记录投影为可导出的行数据，保留样本日期与证券。
 def prediction_rows(
     predictions: Sequence[PredictionRecord],
 ) -> tuple[Mapping[str, object], ...]:
@@ -667,30 +703,141 @@ def prediction_rows(
     return tuple(rows)
 
 
+def build_model_metadata(
+    *, model: ModelSpec, training_parameters: Mapping[str, object],
+    feature_names: tuple[str, ...], dataset: DatasetSplits,
+    random_seed: int, data_identity: ModelDataIdentity,
+    framework_name: str, framework_version: str,
+) -> ModelMetadata:
+    """两个训练后端使用同一份特征、数据区间和模型身份说明。"""
+    return ModelMetadata(
+        schema_version=MODEL_BUNDLE_SCHEMA_VERSION,
+        model_id=model.model_id,
+        model_class_name=model.model_class_name,
+        model_parameters_json=canonical_json(model.model_parameters),
+        training_parameters_json=canonical_json(training_parameters),
+        feature_names=feature_names,
+        feature_fingerprint=feature_fingerprint(feature_names, DAILY_FORWARD_RETURN_LABEL),
+        label_name=DAILY_FORWARD_RETURN_LABEL,
+        train_range=dataset.train_range, valid_range=dataset.valid_range,
+        test_range=dataset.test_range, random_seed=random_seed,
+        data_identity=data_identity, trained_through=dataset.trained_through,
+        framework_name=framework_name, framework_version=framework_version,
+    )
+
+
+def build_inference_payload(
+    *, metadata: ModelMetadata, feature_names: tuple[str, ...],
+    required_history: int, portfolio: ModelPortfolioPolicy, source_run_dir: Path,
+) -> dict[str, object]:
+    """保存格式保持原样；XGBoost 写入 JSON 时自然将 tuple 转成 list。"""
+    return {
+        "input_dim": len(feature_names),
+        "feature_order": feature_names,
+        "required_history_trading_days": required_history,
+        "portfolio_json": canonical_json(portfolio.resolved_dict()),
+        "source_run_dir": str(source_run_dir),
+        "factor_schema": {
+            "feature_names": feature_names,
+            "label_name": metadata.label_name,
+            "feature_fingerprint": metadata.feature_fingerprint,
+        },
+    }
+
+
+# 要求数据集特征名与构建器相同，并使用项目规定的日频未来收益标签。
+def validate_dataset_schema(dataset: DatasetSplits, feature_names: tuple[str, ...]) -> None:
+    if not isinstance(dataset, DatasetSplits):
+        raise TypeError("dataset must be DatasetSplits")
+    if dataset.feature_names != feature_names:
+        raise ValueError("dataset feature_names do not match FeatureBuilder")
+    if dataset.label_name != DAILY_FORWARD_RETURN_LABEL:
+        raise ValueError("dataset label does not match the daily forward-return contract")
+
+
+# 逐项核对产物元数据与期望值；提供信号日时要求训练信号截止日严格更早。
+def validate_model_metadata(
+    metadata: ModelMetadata,
+    expected: Mapping[str, object],
+    error_type: type[ValueError],
+    *, signal_date: date | None = None,
+) -> None:
+    for field_name, expected_value in expected.items():
+        if getattr(metadata, field_name) != expected_value:
+            raise error_type(f"bundle metadata mismatch for {field_name}")
+    if signal_date is not None and metadata.trained_through >= signal_date:
+        raise error_type("bundle trained_through must precede signal_date")
+
+
+def validate_inference_payload(
+    inference: Mapping[str, object],
+    *, feature_names: tuple[str, ...], required_history: int,
+    portfolio: ModelPortfolioPolicy, metadata: ModelMetadata,
+    error_type: type[ValueError], json_schema: bool = False,
+) -> tuple[str, str]:
+    """共用推理检查；Torch 特征列表存为 tuple，XGBoost JSON 中存为 list。"""
+    input_dim = inference.get("input_dim")
+    if type(input_dim) is not int:
+        raise error_type("input_dim must be int")
+    if input_dim != len(feature_names):
+        raise error_type("bundle input_dim does not match feature count")
+    raw_order = inference.get("feature_order")
+    if isinstance(raw_order, (str, bytes)) or not isinstance(raw_order, Sequence):
+        raise error_type("bundle feature_order must be a sequence")
+    if tuple(raw_order) != feature_names:
+        raise error_type("bundle feature_order does not match Model source")
+    history = inference.get("required_history_trading_days")
+    if type(history) is not int:
+        raise error_type("required_history_trading_days must be int")
+    if history != required_history:
+        raise error_type("bundle history requirement does not match Model source")
+    portfolio_json = canonical_json(portfolio.resolved_dict())
+    if inference.get("portfolio_json") != portfolio_json:
+        raise error_type("bundle portfolio does not match Model source")
+    source_run_dir = inference.get("source_run_dir")
+    if not isinstance(source_run_dir, str) or not source_run_dir.strip():
+        raise error_type("bundle source_run_dir is missing")
+    schema = inference.get("factor_schema")
+    if not isinstance(schema, Mapping):
+        raise error_type("factor_schema must be a mapping")
+    expected_schema = {
+        "feature_names": list(feature_names) if json_schema else feature_names,
+        "label_name": metadata.label_name,
+        "feature_fingerprint": metadata.feature_fingerprint,
+    }
+    if dict(schema) != expected_schema:
+        raise error_type("bundle factor schema does not match metadata")
+    return portfolio_json, source_run_dir
+
+
 __all__ = [
     "DAILY_FORWARD_RETURN_LABEL",
     "MODEL_BUNDLE_SCHEMA_VERSION",
-    "Dataset",
     "DatasetSplits",
     "DateRange",
     "FeatureBuilder",
     "FeatureRecord",
     "LabeledRecord",
-    "Model",
-    "ModelArtifactWriter",
     "ModelDataIdentity",
     "ModelMetadata",
+    "ModelSpec",
+    "ModelWorkflow",
+    "ModelWorkflowResult",
     "PredictionRecord",
     "PredictorBundle",
-    "Record",
     "RegressionMetricReport",
     "SampleKey",
     "TorchModelFactory",
     "build_feature_record",
+    "build_model_metadata",
+    "build_inference_payload",
     "canonical_json",
     "feature_fingerprint",
     "feature_records_for_signal",
     "prediction_rows",
     "validate_feature_builder",
     "validate_feature_names",
+    "validate_dataset_schema",
+    "validate_model_metadata",
+    "validate_inference_payload",
 ]

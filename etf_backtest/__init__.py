@@ -1,4 +1,4 @@
-"""QMT MySQL daily-close ETF backtesting framework."""
+"""基于 QMT MySQL 日频收盘数据的 ETF 回测框架。"""
 
 __version__ = "0.2.0"
 

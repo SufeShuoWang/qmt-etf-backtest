@@ -1,15 +1,17 @@
-"""Resolve explicit symbols and named current-master pools into one run universe."""
+"""将显式证券和基于当前主表的命名资产池解析为单次运行的证券范围。"""
 
 from __future__ import annotations
+
 
 import csv
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 
+from etf_backtest.validation import plain_date as _plain_date
 from etf_backtest.config.schema import normalize_symbol
 from etf_backtest.core.market import EtfInfo
 from etf_backtest.data.mysql import QmtEtfMasterRecord
@@ -21,28 +23,27 @@ _STOCK_FUND_TYPE = "\u80a1\u7968\u578b"
 
 
 class UniverseResolutionError(ValueError):
-    """The requested universe cannot be frozen without silent assumptions."""
+    """请求的证券范围无法在不引入隐含假设的情况下冻结。"""
 
 
 class UniverseRepository(Protocol):
-    """Read-only master-data capabilities required by the resolver."""
+    """解析器所需的只读主数据接口。"""
 
+    # 提供资产池解析使用的数据集版本。
     @property
     def dataset_version(self) -> str: ...
 
+    # 按显式证券查询当前 ETF 主表记录。
     def load_etf_master(self, symbols: Sequence[str]) -> tuple[QmtEtfMasterRecord, ...]: ...
 
+    # 按支持的资产池分类查询当前 ETF 主表记录。
     def load_pool_etf_master(self, pool_name: str) -> tuple[QmtEtfMasterRecord, ...]: ...
 
+    # 查询证券最后一条原始行情日期，供缺失退市日期时作近似依据。
     def load_last_raw_trade_dates(self, symbols: Sequence[str]) -> Mapping[str, date]: ...
 
 
-def _plain_date(value: object, field_name: str) -> date:
-    if isinstance(value, datetime) or not isinstance(value, date):
-        raise TypeError(f"{field_name} must be datetime.date")
-    return value
-
-
+# 校验资产池名称并整理为稳定、不重复的池序列。
 def _normalize_pools(pools: Sequence[str]) -> tuple[str, ...]:
     if isinstance(pools, (str, bytes)) or not isinstance(pools, Sequence):
         raise TypeError("pools must be a sequence of strings")
@@ -55,6 +56,7 @@ def _normalize_pools(pools: Sequence[str]) -> tuple[str, ...]:
     return normalized
 
 
+# 规范显式证券代码并去重排序。
 def _normalize_explicit(symbols: Sequence[str]) -> tuple[str, ...]:
     if isinstance(symbols, (str, bytes)) or not isinstance(symbols, Sequence):
         raise TypeError("explicit_symbols must be a sequence")
@@ -63,7 +65,7 @@ def _normalize_explicit(symbols: Sequence[str]) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class FrozenUniverseMember:
-    """One master record and its deterministic run-interval decision."""
+    """单条主数据记录及其确定性的运行区间判定。"""
 
     info: EtfInfo
     sources: tuple[str, ...]
@@ -73,6 +75,7 @@ class FrozenUniverseMember:
     exclusion_reason: str | None
     pool_classification_approximated: bool
 
+    # 校验冻结成员的来源、有效日期及纳入／排除原因是否一致。
     def __post_init__(self) -> None:
         if not isinstance(self.info, EtfInfo):
             raise TypeError("info must be EtfInfo")
@@ -91,10 +94,12 @@ class FrozenUniverseMember:
         if not self.included and not self.exclusion_reason:
             raise ValueError("excluded member requires an exclusion reason")
 
+    # 从成员主信息读取标准证券代码。
     @property
     def symbol(self) -> str:
         return self.info.symbol
 
+    # 判断该成员在指定日期是否处于纳入且有效的生命周期区间。
     def is_active(self, trade_date: date) -> bool:
         value = _plain_date(trade_date, "trade_date")
         return self.included and self.effective_from <= value <= self.effective_to
@@ -102,7 +107,7 @@ class FrozenUniverseMember:
 
 @dataclass(frozen=True, slots=True)
 class FrozenUniverse:
-    """Resolved union plus every inclusion/exclusion decision for audit output."""
+    """解析后的并集以及用于审计输出的全部纳入与排除判定。"""
 
     dataset_version: str
     run_start_date: date
@@ -112,6 +117,7 @@ class FrozenUniverse:
     decisions: tuple[FrozenUniverseMember, ...]
     approximation_flags: tuple[str, ...]
 
+    # 检查冻结资产池的数据版本、运行区间以及成员决策的排序与唯一性。
     def __post_init__(self) -> None:
         if not self.dataset_version.strip():
             raise ValueError("dataset_version must not be blank")
@@ -123,24 +129,30 @@ class FrozenUniverse:
         if symbols != tuple(sorted(set(symbols))):
             raise ValueError("universe decisions must have unique sorted symbols")
 
+    # 返回本次运行实际纳入的资产池成员。
     @property
     def members(self) -> tuple[FrozenUniverseMember, ...]:
         return tuple(decision for decision in self.decisions if decision.included)
 
+    # 返回已纳入成员的标准证券代码。
     @property
     def symbols(self) -> tuple[str, ...]:
         return tuple(member.symbol for member in self.members)
 
+    # 返回已纳入成员的 ETF 主信息。
     @property
     def etf_infos(self) -> tuple[EtfInfo, ...]:
         return tuple(member.info for member in self.members)
 
+    # 筛选某个交易日处于有效生命周期内的证券。
     def active_symbols(self, trade_date: date) -> tuple[str, ...]:
         return tuple(member.symbol for member in self.members if member.is_active(trade_date))
 
+    # 按标准证券代码取得对应冻结成员。
     def member_by_symbol(self) -> Mapping[str, FrozenUniverseMember]:
         return MappingProxyType({member.symbol: member for member in self.members})
 
+    # 把纳入／排除决策及近似标志转换为可导出的记录行。
     def csv_rows(self) -> tuple[Mapping[str, str], ...]:
         rows: list[Mapping[str, str]] = []
         for decision in self.decisions:
@@ -170,7 +182,7 @@ class FrozenUniverse:
         return tuple(rows)
 
     def write_csv(self, path: Path) -> Path:
-        """Write the stable ``universe.csv`` audit artifact."""
+        """写入稳定的 ``universe.csv`` 审计文件。"""
 
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -200,11 +212,13 @@ class FrozenUniverse:
 
 
 class FrozenUniverseResolver:
-    """Resolve an explicit-plus-pools union against one frozen current master."""
+    """基于冻结的当前主表解析显式证券与资产池的并集。"""
 
+    # 绑定资产池查询仓库，供显式证券与命名资产池解析。
     def __init__(self, repository: UniverseRepository) -> None:
         self._repository = repository
 
+    # 合并显式证券和当前主表资产池，按上市／退市区间决定纳入；退市日期缺失时可用最后原始行情日期并标记近似。
     def resolve(
         self,
         *,
@@ -313,6 +327,7 @@ class FrozenUniverseResolver:
             approximation_flags=tuple(sorted(flags)),
         )
 
+    # 合并不同来源的同证券主表记录，冲突时拒绝覆盖。
     @staticmethod
     def _merge_record(records: dict[str, QmtEtfMasterRecord], record: QmtEtfMasterRecord) -> None:
         existing = records.get(record.symbol)
@@ -320,6 +335,7 @@ class FrozenUniverseResolver:
             raise UniverseResolutionError(f"conflicting current-master rows for {record.symbol}")
         records[record.symbol] = record
 
+    # 检查证券类型属于当前支持的境内股票 ETF 或黄金 ETF 范围。
     @staticmethod
     def _validate_supported_record(record: QmtEtfMasterRecord) -> None:
         status = record.current_status.strip().upper()
@@ -335,6 +351,7 @@ class FrozenUniverseResolver:
                 f"unsupported ETF category for universe member {record.symbol}"
             )
 
+    # 把主表及补齐后的生命周期字段转换为 EtfInfo，并保留近似退市标志。
     @staticmethod
     def _to_etf_info(
         record: QmtEtfMasterRecord,

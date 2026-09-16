@@ -1,4 +1,4 @@
-"""Daily T+0/T+1 availability lives in the Position state."""
+"""日频 T+0/T+1 可用数量由 Position 状态维护的测试。"""
 
 from __future__ import annotations
 

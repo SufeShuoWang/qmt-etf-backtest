@@ -1,4 +1,4 @@
-"""Daily engine test doubles and deterministic three-frame fixture."""
+"""日频引擎测试替身和确定性三行情帧 fixture。"""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from etf_backtest.core.market import (
 from etf_backtest.core.order import RuleCheckResult, RuleReasonCode
 from etf_backtest.core.order_generator import OrderGenerator
 from etf_backtest.core.position import Position
-from etf_backtest.core.slippage import SlippageModel
+from etf_backtest.core.fill import SlippageModel
 from etf_backtest.core.target import NO_REBALANCE, TargetPortfolio
 from etf_backtest.strategy.base import BaseStrategy
 
@@ -232,7 +232,7 @@ class RotateInThenCashStrategy(BaseStrategy):
             return NO_REBALANCE
         if context.frame_index == 0:
             return TargetPortfolio(weights={SYMBOL: Decimal("1")})
-        return TargetPortfolio(weights={})
+        return TargetPortfolio(weights={SYMBOL: Decimal("0")})
 
 
 @pytest.fixture

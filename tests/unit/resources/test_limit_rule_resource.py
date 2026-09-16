@@ -1,4 +1,4 @@
-"""Integrity checks for the frozen ETF 20% price-limit resource."""
+"""冻结 ETF 20% 涨跌幅限制资源的完整性检查。"""
 
 from __future__ import annotations
 

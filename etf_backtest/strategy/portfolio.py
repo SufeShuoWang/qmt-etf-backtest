@@ -1,4 +1,4 @@
-"""Framework-neutral portfolio policies for daily Model predictions."""
+"""用于日频 Model 预测且与具体框架无关的组合策略。"""
 
 from __future__ import annotations
 
@@ -22,22 +22,23 @@ AllocationFunction = Callable[
 
 @runtime_checkable
 class ModelPortfolioPolicy(Protocol):
-    """Allocate one signal date's predictions into a complete target portfolio."""
+    """将单个信号日的预测分配为完整目标组合。"""
 
     @property
     def max_total_weight(self) -> Decimal:
-        """Return the maximum exposure this policy may allocate."""
+        """返回该策略允许分配的最大仓位。"""
 
     def allocate(
         self,
         predictions: Sequence[PredictionRecord],
     ) -> Mapping[str, Decimal]:
-        """Return validated target weights keyed by predicted symbol."""
+        """返回按预测证券索引且经过校验的目标权重。"""
 
     def resolved_dict(self) -> dict[str, object]:
-        """Return JSON-compatible policy provenance."""
+        """返回兼容 JSON 的组合策略来源信息。"""
 
 
+# 将组合参数或权重输入规范为有限 Decimal。
 def _decimal_value(value: object, field_name: str) -> Decimal:
     if isinstance(value, bool):
         raise TypeError(f"{field_name} must not be boolean")
@@ -55,6 +56,7 @@ def _decimal_value(value: object, field_name: str) -> Decimal:
     return parsed
 
 
+# 校验组合总仓位约束，拒绝不合法的敞口设置。
 def _exposure(value: object) -> Decimal:
     parsed = _decimal_value(value, "total_weight")
     if not Decimal("0") < parsed <= Decimal("1"):
@@ -62,6 +64,7 @@ def _exposure(value: object) -> Decimal:
     return parsed
 
 
+# 将组合算法使用的输入转换为有限浮点数。
 def _finite_float(value: object, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise TypeError(f"{field_name} must be numeric")
@@ -71,6 +74,7 @@ def _finite_float(value: object, field_name: str) -> float:
     return parsed
 
 
+# 校验并整理预测序列，避免重复证券等歧义输入。
 def _freeze_predictions(
     predictions: Sequence[PredictionRecord],
 ) -> tuple[PredictionRecord, ...]:
@@ -89,6 +93,7 @@ def _freeze_predictions(
     return frozen
 
 
+# 检查组合输出证券及权重合法、总和符合上限，并形成稳定映射。
 def _validated_weights(
     value: object,
     *,
@@ -127,7 +132,7 @@ def validate_model_allocation(
     predictions: Sequence[PredictionRecord],
     exposure_cap: object,
 ) -> Mapping[str, Decimal]:
-    """Apply the non-bypassable validation boundary to any policy output."""
+    """对任意组合策略输出应用不可绕过的校验边界。"""
 
     return _validated_weights(
         value,
@@ -136,6 +141,7 @@ def validate_model_allocation(
     )
 
 
+# 把选中证券的原始分配值按目标总仓位归一化。
 def _normalized_weights(
     ranked: tuple[PredictionRecord, ...],
     raw_weights: tuple[Decimal, ...],
@@ -164,7 +170,7 @@ def _normalized_weights(
 
 @dataclass(frozen=True, slots=True)
 class TopKPortfolio:
-    """Select the highest qualifying scores and allocate one exposure budget."""
+    """选择最高的合格分数，并分配单个仓位预算。"""
 
     top_k: int = 1
     total_weight: PortfolioWeightInput = Decimal("0.90")
@@ -172,6 +178,7 @@ class TopKPortfolio:
     weighting: WeightingMode = "score_proportional"
     softmax_temperature: float = 1.0
 
+    # 检查 TopK 数量、筛选阈值、分配方式、温度和总仓位等参数。
     def __post_init__(self) -> None:
         if type(self.top_k) is not int or self.top_k <= 0:
             raise ValueError("top_k must be a positive integer")
@@ -186,10 +193,12 @@ class TopKPortfolio:
         object.__setattr__(self, "min_score", min_score)
         object.__setattr__(self, "softmax_temperature", temperature)
 
+    # 返回 TopK 政策允许的总目标仓位。
     @property
     def max_total_weight(self) -> Decimal:
         return cast(Decimal, self.total_weight)
 
+    # 筛选严格超过阈值的预测并选前 K 个，按等权、超阈值得分比例或 softmax 分配目标仓位。
     def allocate(
         self,
         predictions: Sequence[PredictionRecord],
@@ -217,6 +226,7 @@ class TopKPortfolio:
             )
         return _normalized_weights(ranked, raw_weights, self.max_total_weight)
 
+    # 导出 TopK 选择和分配设置，供训练产物与推理一致性检查。
     def resolved_dict(self) -> dict[str, object]:
         return {
             "type": "top_k",
@@ -230,12 +240,13 @@ class TopKPortfolio:
 
 @dataclass(frozen=True, slots=True)
 class CustomPortfolio:
-    """Validate a trusted local allocation function defined in ``model.py``."""
+    """校验 ``model.py`` 中定义的可信本地分配函数。"""
 
     name: str
     total_weight: PortfolioWeightInput
     allocator: AllocationFunction
 
+    # 要求自定义分配器名称非空、分配函数可调用，并规范组合总仓位。
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("name must not be blank")
@@ -244,10 +255,12 @@ class CustomPortfolio:
         object.__setattr__(self, "name", self.name.strip())
         object.__setattr__(self, "total_weight", _exposure(self.total_weight))
 
+    # 返回自定义组合政策声明的总仓位上限。
     @property
     def max_total_weight(self) -> Decimal:
         return cast(Decimal, self.total_weight)
 
+    # 调用自定义分配逻辑后统一校验证券与权重，防止输出越过组合接口边界。
     def allocate(
         self,
         predictions: Sequence[PredictionRecord],
@@ -260,6 +273,7 @@ class CustomPortfolio:
             exposure_cap=self.max_total_weight,
         )
 
+    # 导出自定义分配器的身份及参数，供结果溯源与产物核对。
     def resolved_dict(self) -> dict[str, object]:
         return {
             "type": "custom",

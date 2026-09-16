@@ -6,7 +6,7 @@ start_date: 2024-01-01
 end_date: 2024-12-31
 initial_cash: "1000000"
 
-# 每次只运行一种策略。填写 rule 或 model；需要比较时分别运行两个实验。
+# 每次只运行一种策略，填写 rule 或 model；当前回测框架不提供策略对比功能。
 case: rule
 
 # universe 至少填写 symbols 或 pools 之一，也可以同时填写，系统会取并集并去重。
@@ -19,8 +19,8 @@ universe:
   symbols: [SH.510300, SH.518880, SH.588000]
   pools: []
   # 只用资产池：把 symbols 改成 []，并使用以下任一写法：
-  # pools: [domestic_stock_etf, gold_etf]
-  # pools: [all_supported_etf]
+# pools: [domestic_stock_etf, gold_etf]  # 可选的多个资产池示例
+# pools: [all_supported_etf]  # 可选的全部支持资产池示例
   # 也可以同时保留 symbols 和 pools。
 
 # Rule 的回看、调仓、仓位和阈值在 rule.py 的 RuleSettings 中修改。

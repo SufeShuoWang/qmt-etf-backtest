@@ -1,4 +1,4 @@
-"""Public configuration and scaffolding for private strategy experiments."""
+"""私有策略实验的公开配置 API。"""
 
 from etf_backtest.experiments.config import (
     SystemSettings,
@@ -6,16 +6,10 @@ from etf_backtest.experiments.config import (
     load_system_settings,
     load_user_experiment_config,
 )
-from etf_backtest.experiments.scaffold import (
-    DEFAULT_PRIVATE_STRATEGY_ROOT,
-    scaffold_experiment,
-)
 
 __all__ = [
-    "DEFAULT_PRIVATE_STRATEGY_ROOT",
     "SystemSettings",
     "UserExperimentConfig",
     "load_system_settings",
     "load_user_experiment_config",
-    "scaffold_experiment",
 ]

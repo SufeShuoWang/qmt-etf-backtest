@@ -22,8 +22,9 @@ def test_order_generator_is_deterministic_and_sorts_sells_before_buys() -> None:
         },
     )
     snapshot = account.snapshot({"510300": Decimal("4"), "159915": Decimal("2")})
+    target = TargetPortfolio({"510300": Decimal("0"), "159915": Decimal("0.90")})
     orders = OrderGenerator().generate(
-        target_portfolio=TargetPortfolio({"159915": Decimal("0.90")}),
+        target_portfolio=target,
         valuation_snapshot=snapshot,
         signal_date=date(2024, 1, 2),
         execution_date=date(2024, 1, 3),
@@ -32,8 +33,30 @@ def test_order_generator_is_deterministic_and_sorts_sells_before_buys() -> None:
     assert orders[0].requested_quantity == 100
     assert orders[1].requested_quantity == 600
     assert orders == OrderGenerator().generate(
-        target_portfolio=TargetPortfolio({"159915": Decimal("0.90")}),
+        target_portfolio=target,
         valuation_snapshot=snapshot,
         signal_date=date(2024, 1, 2),
         execution_date=date(2024, 1, 3),
     )
+
+
+def test_order_generator_does_not_trade_an_omitted_holding() -> None:
+    account = Account(
+        cash=Decimal("1000"),
+        positions={
+            "510300": Position(
+                "510300", TurnoverRule.T1, total_quantity=100, available_quantity=100
+            ),
+            "159915": Position("159915", TurnoverRule.T1),
+        },
+    )
+    snapshot = account.snapshot({"510300": Decimal("4"), "159915": Decimal("2")})
+
+    orders = OrderGenerator().generate(
+        target_portfolio=TargetPortfolio({"159915": Decimal("0.50")}),
+        valuation_snapshot=snapshot,
+        signal_date=date(2024, 1, 2),
+        execution_date=date(2024, 1, 3),
+    )
+
+    assert [(order.side, order.symbol) for order in orders] == [(OrderSide.BUY, "SZ.159915")]

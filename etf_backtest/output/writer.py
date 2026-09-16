@@ -1,4 +1,4 @@
-"""Atomic writer for the small, fixed public backtest output contract."""
+"""以原子方式写入精简、固定的公开回测输出。"""
 
 from __future__ import annotations
 
@@ -17,12 +17,13 @@ from uuid import uuid4
 
 from etf_backtest.core.account import DailySnapshot
 from etf_backtest.core.engine import BacktestResult
-from etf_backtest.core.order import FillResult, Order, RuleCheckResult
+from etf_backtest.core.order import RuleCheckResult
 from etf_backtest.evaluation.backtest_metrics import BacktestMetricResult
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _SECRET_FRAGMENTS = ("password", "passwd", "secret", "token", "credential", "api_key")
 _PLOT_FILENAMES = frozenset(("cumulative_return.png", "drawdown.png", "cash.png"))
+_MODEL_BUNDLE_FILENAMES = frozenset(("model_bundle.pt", "model_bundle.ubj"))
 _COMMON_FILENAMES = frozenset(
     (
         "run.json",
@@ -37,15 +38,67 @@ _COMMON_FILENAMES = frozenset(
 )
 _ZERO = Decimal("0")
 
+# 固定输出列；同一清单同时用于取值和 CSV 表头。
+_DAILY_FIELDS = (
+    "trade_date",
+    "cash",
+    "market_value",
+    "total_asset",
+)
+_ORDER_FIELDS = (
+    "order_id",
+    "signal_date",
+    "execution_date",
+    "symbol",
+    "side",
+    "target_value_gap",
+    "requested_quantity",
+)
+_APPROVAL_FIELDS = (
+    "approved_quantity",
+    "passed",
+    "reason_code",
+    "message",
+    "base_trade_price",
+    "price_limit_down",
+    "price_limit_up",
+    "price_limit_source",
+    "price_limit_fallback_reason",
+)
+_TRADE_FIELDS = (
+    "order_id",
+    "signal_date",
+    "execution_date",
+    "trade_time",
+    "source_record_key",
+    "symbol",
+    "side",
+    "requested_quantity",
+    "fill_quantity",
+    "base_trade_price",
+    "fill_price",
+    "trade_amount",
+    "fee",
+    "status",
+    "price_source",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ModelArtifacts:
-    """The only two Model-specific public artifacts."""
+    """Model 专属的两项公开结果文件。"""
 
     bundle_path: Path
     predictions: Sequence[Mapping[str, object]]
+    bundle_filename: str = "model_bundle.pt"
+
+    # 要求模型包文件名属于预先允许的名称，防止输出未知或越界文件。
+    def __post_init__(self) -> None:
+        if self.bundle_filename not in _MODEL_BUNDLE_FILENAMES:
+            raise ValueError("unsupported or unsafe model bundle filename")
 
 
+# 检查运行 ID 可作为安全目录名，避免结果写入越界路径。
 def _safe_run_id(value: str) -> str:
     if not isinstance(value, str):
         raise TypeError("run_id must be str")
@@ -55,11 +108,13 @@ def _safe_run_id(value: str) -> str:
     return normalized
 
 
+# 识别密码等敏感字段名，供结果递归脱敏。
 def _is_secret_key(key: object) -> bool:
     folded = str(key).casefold()
     return any(fragment in folded for fragment in _SECRET_FRAGMENTS)
 
 
+# 把日期、Decimal、枚举、路径和映射等转换为可写 JSON 的值，并处理敏感字段。
 def _json_value(value: object, *, key_hint: object | None = None) -> object:
     if key_hint is not None and _is_secret_key(key_hint):
         return "***"
@@ -91,6 +146,7 @@ def _json_value(value: object, *, key_hint: object | None = None) -> object:
     raise TypeError(f"unsupported output value: {type(value).__qualname__}")
 
 
+# 递归收集敏感字段对应的值，供错误文本脱敏使用。
 def _secret_values(value: object, *, key_hint: object | None = None) -> set[str]:
     if key_hint is not None and _is_secret_key(key_hint):
         if isinstance(value, str) and value:
@@ -113,6 +169,7 @@ def _secret_values(value: object, *, key_hint: object | None = None) -> set[str]
     return set()
 
 
+# 将处理后的对象编码为稳定、可读的 JSON 文本。
 def _json_text(payload: Mapping[str, object]) -> str:
     return (
         json.dumps(
@@ -126,10 +183,12 @@ def _json_text(payload: Mapping[str, object]) -> str:
     )
 
 
+# 将对象以项目约定的 JSON 格式写入文件。
 def _write_json(directory: Path, filename: str, payload: Mapping[str, object]) -> None:
     (directory / filename).write_text(_json_text(payload), encoding="utf-8", newline="\n")
 
 
+# 按固定列顺序写入 CSV，供账户、订单和成交结果导出。
 def _write_csv(
     directory: Path,
     filename: str,
@@ -143,15 +202,12 @@ def _write_csv(
             writer.writerow({name: _json_value(row.get(name)) for name in fieldnames})
 
 
+# 把一个日快照转换为净值 CSV 的行数据。
 def _daily_row(snapshot: DailySnapshot) -> Mapping[str, object]:
-    return {
-        "trade_date": snapshot.trade_date,
-        "cash": snapshot.cash,
-        "market_value": snapshot.market_value,
-        "total_asset": snapshot.total_asset,
-    }
+    return {name: getattr(snapshot, name) for name in _DAILY_FIELDS}
 
 
+# 把单日日快照中的各证券持仓展开成明细行，计算原始价市值与组合权重。
 def _position_rows(snapshot: DailySnapshot) -> tuple[Mapping[str, object], ...]:
     account = snapshot.account_snapshot
     rows: list[Mapping[str, object]] = []
@@ -175,6 +231,7 @@ def _position_rows(snapshot: DailySnapshot) -> tuple[Mapping[str, object], ...]:
     return tuple(rows)
 
 
+# 把订单与审批结果关联，输出请求数量、批准数量及拒绝原因等字段。
 def _order_rows(result: BacktestResult) -> tuple[Mapping[str, object], ...]:
     approvals: dict[str, RuleCheckResult] = {}
     for approval in result.approvals:
@@ -183,50 +240,16 @@ def _order_rows(result: BacktestResult) -> tuple[Mapping[str, object], ...]:
         approvals[approval.order_id] = approval
     if set(approvals) != {order.order_id for order in result.orders}:
         raise ValueError("each order must have exactly one approval")
-    return tuple(_order_row(order, approvals[order.order_id]) for order in result.orders)
+    return tuple(
+        {
+            **{name: getattr(order, name) for name in _ORDER_FIELDS},
+            **{name: getattr(approvals[order.order_id], name) for name in _APPROVAL_FIELDS},
+        }
+        for order in result.orders
+    )
 
 
-def _order_row(order: Order, approval: RuleCheckResult) -> Mapping[str, object]:
-    return {
-        "order_id": order.order_id,
-        "signal_date": order.signal_date,
-        "execution_date": order.execution_date,
-        "symbol": order.symbol,
-        "side": order.side,
-        "target_value_gap": order.target_value_gap,
-        "requested_quantity": order.requested_quantity,
-        "approved_quantity": approval.approved_quantity,
-        "passed": approval.passed,
-        "reason_code": approval.reason_code,
-        "message": approval.message,
-        "base_trade_price": approval.base_trade_price,
-        "price_limit_down": approval.price_limit_down,
-        "price_limit_up": approval.price_limit_up,
-        "price_limit_source": approval.price_limit_source,
-        "price_limit_fallback_reason": approval.price_limit_fallback_reason,
-    }
-
-
-def _trade_row(fill: FillResult) -> Mapping[str, object]:
-    return {
-        "order_id": fill.order_id,
-        "signal_date": fill.signal_date,
-        "execution_date": fill.execution_date,
-        "trade_time": fill.trade_time,
-        "source_record_key": fill.source_record_key,
-        "symbol": fill.symbol,
-        "side": fill.side,
-        "requested_quantity": fill.requested_quantity,
-        "fill_quantity": fill.fill_quantity,
-        "base_trade_price": fill.base_trade_price,
-        "fill_price": fill.fill_price,
-        "trade_amount": fill.trade_amount,
-        "fee": fill.fee,
-        "status": fill.status,
-        "price_source": fill.price_source,
-    }
-
-
+# 将指标结果整理成输出 JSON 结构。
 def _metrics_payload(metrics: BacktestMetricResult) -> Mapping[str, object]:
     return {
         "daily_returns": metrics.daily_returns,
@@ -244,6 +267,7 @@ def _metrics_payload(metrics: BacktestMetricResult) -> Mapping[str, object]:
     }
 
 
+# 提取最后一个账户快照，生成最终现金、持仓和资产结果。
 def _final_account(snapshot: DailySnapshot) -> Mapping[str, object]:
     return {
         **_daily_row(snapshot),
@@ -255,11 +279,13 @@ def _final_account(snapshot: DailySnapshot) -> Mapping[str, object]:
 
 
 class BacktestOutputWriter:
-    """Write one committed result directory with no optional research files."""
+    """写入单个完整结果目录，不生成可选研究文件。"""
 
+    # 保存结果根目录，供每次运行创建独立输出目录。
     def __init__(self, runs_dir: Path) -> None:
         self._runs_dir = Path(runs_dir).resolve()
 
+    # 组织成功运行的固定结果集及可选模型产物，写入临时目录后原子发布。
     def write_success(
         self,
         *,
@@ -289,8 +315,9 @@ class BacktestOutputWriter:
         order_rows = _order_rows(result)
         expected = set(_COMMON_FILENAMES)
         if model_artifacts is not None:
-            expected.update(("model_bundle.pt", "predictions.csv"))
+            expected.update((model_artifacts.bundle_filename, "predictions.csv"))
 
+        # 在尚未发布的目录中写入成功元数据、回测结果和模型文件。
         def populate(directory: Path) -> None:
             self._write_result_files(
                 directory,
@@ -317,6 +344,7 @@ class BacktestOutputWriter:
 
         return self._commit(normalized_id, populate)
 
+    # 保存失败运行的元数据与脱敏错误说明，便于排查中断原因。
     def write_failure(
         self,
         *,
@@ -333,6 +361,7 @@ class BacktestOutputWriter:
         for secret in sorted(_secret_values(run_metadata), key=len, reverse=True):
             message = message.replace(secret, "***")
 
+        # 在临时目录中写入失败 run.json，交给统一提交流程发布。
         def populate(directory: Path) -> None:
             _write_json(
                 directory,
@@ -348,6 +377,7 @@ class BacktestOutputWriter:
 
         return self._commit(normalized_id, populate)
 
+    # 写入净值、持仓、订单、成交、指标、最终账户和绘图等结果文件。
     def _write_result_files(
         self,
         directory: Path,
@@ -362,7 +392,7 @@ class BacktestOutputWriter:
         _write_csv(
             directory,
             "daily_nav.csv",
-            ("trade_date", "cash", "market_value", "total_asset"),
+            _DAILY_FIELDS,
             tuple(_daily_row(row) for row in ordered_daily),
         )
         _write_csv(
@@ -384,47 +414,14 @@ class BacktestOutputWriter:
         _write_csv(
             directory,
             "orders.csv",
-            (
-                "order_id",
-                "signal_date",
-                "execution_date",
-                "symbol",
-                "side",
-                "target_value_gap",
-                "requested_quantity",
-                "approved_quantity",
-                "passed",
-                "reason_code",
-                "message",
-                "base_trade_price",
-                "price_limit_down",
-                "price_limit_up",
-                "price_limit_source",
-                "price_limit_fallback_reason",
-            ),
+            _ORDER_FIELDS + _APPROVAL_FIELDS,
             order_rows,
         )
         _write_csv(
             directory,
             "trades.csv",
-            (
-                "order_id",
-                "signal_date",
-                "execution_date",
-                "trade_time",
-                "source_record_key",
-                "symbol",
-                "side",
-                "requested_quantity",
-                "fill_quantity",
-                "base_trade_price",
-                "fill_price",
-                "trade_amount",
-                "fee",
-                "status",
-                "price_source",
-            ),
-            tuple(_trade_row(fill) for fill in result.fills),
+            _TRADE_FIELDS,
+            tuple({name: getattr(fill, name) for name in _TRADE_FIELDS} for fill in result.fills),
         )
         _write_json(directory, "metrics.json", _metrics_payload(metrics))
         _write_json(directory, "final_account.json", _final_account(ordered_daily[-1]))
@@ -434,7 +431,7 @@ class BacktestOutputWriter:
             bundle = Path(model_artifacts.bundle_path).resolve(strict=True)
             if not bundle.is_file():
                 raise FileNotFoundError(bundle)
-            shutil.copyfile(bundle, directory / "model_bundle.pt")
+            shutil.copyfile(bundle, directory / model_artifacts.bundle_filename)
             predictions = tuple(model_artifacts.predictions)
             _write_csv(
                 directory,
@@ -443,6 +440,7 @@ class BacktestOutputWriter:
                 predictions,
             )
 
+    # 创建临时结果目录，完成全部写入后重命名发布；失败时清理未发布的临时内容。
     def _commit(self, run_id: str, populate: Callable[[Path], None]) -> Path:
         self._runs_dir.mkdir(parents=True, exist_ok=True)
         target = self._runs_dir / run_id
